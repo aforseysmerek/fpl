@@ -98,6 +98,10 @@ def parse_args():
                    help="LoRA rank (--model qwen_lora)")
     p.add_argument("--lora_alpha", type=int, default=16,
                    help="LoRA alpha scaling factor (--model qwen_lora)")
+    p.add_argument("--use_lora", action="store_true",
+                   help="Apply LoRA to the Qwen backbone for ANY qwen* model "
+                        "(implicitly on for --model qwen_lora). Lets qwen_open be "
+                        "trained on a 24GB GPU by shrinking the optimizer state.")
     p.add_argument("--qwen_model_name", type=str, default="Qwen/Qwen3-VL-4B-Instruct",
                    help="HuggingFace model identifier (--model qwen/qwen_lora)")
     p.add_argument("--tune_vision", action="store_true",
@@ -717,7 +721,7 @@ def main():
         model = QwenRewardModel(
             num_preferences=len(preference_keys),  # 1 for open variants
             model_name=args.qwen_model_name,
-            use_lora=(args.model == "qwen_lora"),
+            use_lora=(args.model == "qwen_lora") or args.use_lora,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             reward_sigmoid=args.reward_sigmoid,
