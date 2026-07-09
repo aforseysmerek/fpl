@@ -181,8 +181,12 @@ def load_demo_obs(demo_hdf5, obs_keys, max_demos=None):
 @click.option('--wandb_project', default='reward_cond_pipeline', help='wandb project name')
 @click.option('--reward_axes', default=None,
               help='Comma-separated reward axes to use. Any combination of: success,speed_reward,smoothness,peg_reward,order_reward,milk_placed,bread_placed,cereal_placed,can_placed,drop_reward,composite(...)')
+@click.option('--load_prefs', default=None,
+              help='Path to pairs.npz from generate_preferences.py — train on those exact '
+                   '(idx_a, idx_b, labels) instead of sampling fresh, so the state model uses '
+                   'the SAME pairs as the Qwen model. idx index into demos in demo_0..N order.')
 def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
-         n_pairs, max_seq_len, stride, max_demos, device, wandb_project, reward_axes):
+         n_pairs, max_seq_len, stride, max_demos, device, wandb_project, reward_axes, load_prefs):
     os.makedirs(output_dir, exist_ok=True)
     obs_keys = obs_keys.split(',')
     device = torch.device(device)
@@ -426,12 +430,31 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
     print(f"  Preference pairs: {effective_n_pairs} total ({n_train_pairs} train, {n_val_pairs} val)"
           + (f" [all unique pairs]" if n_pairs is None else f" [specified]"))
 
-    train_dataset = PreferencePairDataset(
-        all_obs, all_lengths, metrics,
-        max_seq_len=max_seq_len, stride=stride, n_pairs=n_train_pairs, seed=42)
-    val_dataset = PreferencePairDataset(
-        all_obs, all_lengths, metrics,
-        max_seq_len=max_seq_len, stride=stride, n_pairs=n_val_pairs, seed=123)
+    if load_prefs is not None:
+        # Train on the EXACT pairs generate_preferences.py produced (the same
+        # pairs the Qwen model gets). idx_a/idx_b index into all_obs in
+        # demo_0..N order, so run with --rollout_data none so all_obs == demos.
+        _p = np.load(load_prefs, allow_pickle=True)
+        _ia, _ib, _lab = _p['idx_a'], _p['idx_b'], _p['labels']
+        _nv = min(max(int(len(_ia) * val_ratio), 1), len(_ia) - 1)
+
+        def _saved_ds(sl, sd):
+            _ds = PreferencePairDataset(all_obs, all_lengths, metrics,
+                                        max_seq_len=max_seq_len, stride=stride, n_pairs=1, seed=sd)
+            _ds.idx_a, _ds.idx_b, _ds.labels = _ia[sl], _ib[sl], _lab[sl]
+            return _ds
+
+        train_dataset = _saved_ds(slice(_nv, None), 42)
+        val_dataset = _saved_ds(slice(0, _nv), 123)
+        print(f"  [load_prefs] using {len(_ia)} saved pairs from {load_prefs} "
+              f"({len(_ia) - _nv} train / {_nv} val)")
+    else:
+        train_dataset = PreferencePairDataset(
+            all_obs, all_lengths, metrics,
+            max_seq_len=max_seq_len, stride=stride, n_pairs=n_train_pairs, seed=42)
+        val_dataset = PreferencePairDataset(
+            all_obs, all_lengths, metrics,
+            max_seq_len=max_seq_len, stride=stride, n_pairs=n_val_pairs, seed=123)
     dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
