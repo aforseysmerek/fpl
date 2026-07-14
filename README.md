@@ -8,6 +8,19 @@ This Repository contains the code for Reward Learning and Simulation
 
 ## Simulation Experiments
 
+#### System dependencies (GPU rendering)
+This repo uses stock `mujoco-py` (instead of `free-mujoco-py`, which overwrites `LD_LIBRARY_PATH` on import and silently breaks GPU render detection, forcing CPU rendering). One-time system setup **before** creating the conda env:
+
+```bash
+# Compile dependencies for mujoco-py
+sudo apt-get install -y libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf libglew-dev
+
+# MuJoCo 2.1.0 binaries (not bundled with stock mujoco-py)
+mkdir -p ~/.mujoco && cd ~/.mujoco
+wget -nc https://github.com/deepmind/mujoco/releases/download/2.1.0/mujoco210-linux-x86_64.tar.gz
+tar -xzf mujoco210-linux-x86_64.tar.gz
+```
+
 ### Installation
 Create the environment using the following commands:
 ```bash
