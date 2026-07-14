@@ -450,6 +450,36 @@ def peg_reward_raw(obs, actions=None, reward_series=None):
 
 
 # ----------------------------------------------------------------------------
+# Wipe axes. These read the wipe collector's state_lowdim layout:
+#   [robot0_eef_pos(3), robot0_eef_quat(4), joints(7), proportion_wiped(1)]
+# eef xy is the first two dims; proportion_wiped is the last dim. (Same layout
+# whether obs comes straight from state_lowdim or is reconstructed from the
+# per-key split, since the split preserves column order.)
+# ----------------------------------------------------------------------------
+def circularity(obs, actions=None, reward_series=None):
+    """Total turning (radians) of the eef xy path — high for circular scrubbing,
+    low for straight wipes. Mirrors scripts/wipe_trace.circularity_metric."""
+    if obs is None or len(obs) < 2:
+        return 0.0
+    eef_xy = np.asarray(obs)[:, 0:2]
+    d = np.diff(eef_xy, axis=0)
+    d = d[np.linalg.norm(d, axis=1) > 1e-5]
+    if len(d) < 2:
+        return 0.0
+    ang = np.arctan2(d[:, 1], d[:, 0])
+    return float(np.sum(np.abs((np.diff(ang) + np.pi) % (2 * np.pi) - np.pi)))
+
+
+def wiped_frac(obs, actions=None, reward_series=None):
+    """Fraction of the spill wiped clean by the end of the trajectory, read from
+    the per-step proportion_wiped sensor stored as the last state dim. Monotonic
+    non-decreasing, so the final step is the max."""
+    if obs is None or len(obs) == 0:
+        return 0.0
+    return float(np.asarray(obs)[-1, -1])
+
+
+# ----------------------------------------------------------------------------
 # Registry: axis name -> function. Add new axes by adding a function and an
 # entry here.
 # ----------------------------------------------------------------------------
@@ -457,6 +487,8 @@ AXIS_FUNCTIONS = {
     'success':        success,
     'speed_reward':   speed_reward,
     'smoothness':     smoothness,
+    'circularity':    circularity,
+    'wiped_frac':     wiped_frac,
     'order_reward':   order_reward,
     'order_reward_raw': order_reward_raw,
     'milk_placed':    milk_placed,

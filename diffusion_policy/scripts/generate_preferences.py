@@ -39,9 +39,14 @@ from train_reward_model import PreferencePairDataset          # THEIR pair gener
 # — split it back into their per-key demo layout (object = everything before the last 9).
 OBS_TAIL = [("robot0_eef_pos", 3), ("robot0_eef_quat", 4), ("robot0_gripper_qpos", 2)]
 
-# readable prompts for the language-conditioned Qwen model (edit as you like)
-AXIS_PROMPT = {"speed_reward": "speed", "smoothness": "smoothness",
-               "peg_reward": "reaches the right peg", "success": "task success"}
+# readable prompts for the language-conditioned Qwen model (edit as you like).
+# These strings are the axis DESCRIPTION the VLM is conditioned on — one fixed
+# phrase per axis, inserted into "What is the score for '<phrase>' in this
+# trajectory?". They are NOT per-trajectory labels.
+AXIS_PROMPT = {"speed_reward": "completes the task quickly", "smoothness": "smoothness",
+               "peg_reward": "places the nut on the right-hand peg", "success": "task success",
+               "circularity": "wipes in circular scrubbing motions",
+               "wiped_frac": "the spill is wiped clean"}
 
 
 def load_episodes(path):
@@ -98,7 +103,7 @@ def main(episodes, reward_axes, n_pairs, seed, max_seq_len, stride, save_state, 
         L = len(d["state"])
         lengths[i] = L
         obs[i, :L] = d["state"]
-        vals = compute_axes(axes, d["state"], actions=d["actions"])   # THEIR metrics
+        vals = compute_axes(axes, d["state"], actions=d["actions"])   # THEIR metrics — single oracle
         metrics[i] = [vals[a] for a in axes]
 
     ds = PreferencePairDataset(obs, lengths, metrics, max_seq_len=max_seq_len,
@@ -106,9 +111,13 @@ def main(episodes, reward_axes, n_pairs, seed, max_seq_len, stride, save_state, 
     idx_a, idx_b, labels = np.asarray(ds.idx_a), np.asarray(ds.idx_b), np.asarray(ds.labels)
 
     print(f"Generated {len(idx_a)} pairs over axes {axes}")
+    print(f"  {'axis':14s}  {'A(pos)':>7s} {'B(neg)':>7s} {'Equal':>7s}")
     for k, ax in enumerate(axes):
         a = int((labels[:, k] == 1.0).sum()); b = int((labels[:, k] == 0.0).sum()); e = int((labels[:, k] == 0.5).sum())
-        print(f"  {ax:14s}  A={a:5d}  B={b:5d}  Equal={e:5d}")
+        print(f"  {ax:14s}  {a:7d} {b:7d} {e:7d}")
+    tot_a = int((labels == 1.0).sum()); tot_b = int((labels == 0.0).sum()); tot_e = int((labels == 0.5).sum())
+    print(f"  {'TOTAL':14s}  {tot_a:7d} {tot_b:7d} {tot_e:7d}   "
+          f"({len(idx_a)} pairs x {len(axes)} axes = {len(idx_a) * len(axes)} labels)")
 
     # ---- state: their demos.hdf5 layout + the exact pairs ----
     if save_state:

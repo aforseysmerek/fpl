@@ -179,6 +179,7 @@ def load_demo_obs(demo_hdf5, obs_keys, max_demos=None):
 @click.option('--max_demos', default=None, type=int, help='Max original demos to include')
 @click.option('--device', default='cuda:0')
 @click.option('--wandb_project', default='reward_cond_pipeline', help='wandb project name')
+@click.option('--wandb_run_name', default='phase2_reward_model', help='wandb run name (set per-task so runs are distinguishable)')
 @click.option('--reward_axes', default=None,
               help='Comma-separated reward axes to use. Any combination of: success,speed_reward,smoothness,peg_reward,order_reward,milk_placed,bread_placed,cereal_placed,can_placed,drop_reward,composite(...)')
 @click.option('--load_prefs', default=None,
@@ -186,7 +187,7 @@ def load_demo_obs(demo_hdf5, obs_keys, max_demos=None):
                    '(idx_a, idx_b, labels) instead of sampling fresh, so the state model uses '
                    'the SAME pairs as the Qwen model. idx index into demos in demo_0..N order.')
 def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
-         n_pairs, max_seq_len, stride, max_demos, device, wandb_project, reward_axes, load_prefs):
+         n_pairs, max_seq_len, stride, max_demos, device, wandb_project, wandb_run_name, reward_axes, load_prefs):
     os.makedirs(output_dir, exist_ok=True)
     obs_keys = obs_keys.split(',')
     device = torch.device(device)
@@ -194,7 +195,7 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
     # Init wandb
     wandb.init(
         project=wandb_project,
-        name='phase2_reward_model',
+        name=wandb_run_name,
         config={
             'rollout_data': rollout_data,
             'demo_hdf5': demo_hdf5,
