@@ -49,10 +49,13 @@ AXIS_PROMPT = {"speed_reward": "completes the task quickly", "smoothness": "smoo
                "wiped_frac": "the spill is wiped clean"}
 
 
-def load_episodes(path):
+def load_episodes(path, n_episodes):
     demos = []
     with h5py.File(path, "r") as f:
         keys = sorted(f["data"].keys(), key=lambda s: int(s.split("_")[1]))
+        if n_episodes is not None:
+            assert n_episodes <= len(keys), "n_episodes exceeds total episodes available"
+            keys = keys[:n_episodes]
         for k in keys:
             g = f["data"][k]
             demos.append(dict(
@@ -82,15 +85,16 @@ def split_state(state):
 @click.option("--episodes", required=True)
 @click.option("--reward_axes", default="speed_reward,peg_reward", help="THEIR reward_functions axes")
 @click.option("--n_pairs", type=int, default=300)
+@click.option("--n_episodes", type=int, default=None)
 @click.option("--seed", type=int, default=42)
 @click.option("--max_seq_len", type=int, default=512)
 @click.option("--stride", type=int, default=1)
 @click.option("--save_state", default=None, help="dir for demos.hdf5 + pairs.npz (state model)")
 @click.option("--save_qwen", default=None, help="dir for co-located pair dirs (qwen)")
 @click.option("--task_prompt", default="place the square nut on the peg")
-def main(episodes, reward_axes, n_pairs, seed, max_seq_len, stride, save_state, save_qwen, task_prompt):
+def main(episodes, reward_axes, n_pairs, n_episodes, seed, max_seq_len, stride, save_state, save_qwen, task_prompt):
     axes = [a.strip() for a in reward_axes.split(",")]
-    demos = load_episodes(episodes)
+    demos = load_episodes(episodes, n_episodes)
     N = len(demos)
     D = demos[0]["state"].shape[-1]
     A = demos[0]["actions"].shape[-1]
