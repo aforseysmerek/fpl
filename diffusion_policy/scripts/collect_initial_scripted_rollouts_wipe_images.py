@@ -69,9 +69,29 @@ def to_uint8_hwc(img):
 @click.option('--seed', type=int, default=0)
 @click.option('--n_waypoints', type=int, default=30)
 @click.option('--seg_steps', type=int, default=12)
-def main(output_dir, num_episodes, seed, n_waypoints, seg_steps):
+@click.option('--bimodal', is_flag=True,
+              help='Sample each knob from only the LOW or HIGH extreme band (no middle values), '
+                   'balanced across the 4 (circ x press) quadrants. Still continuous within a band '
+                   'so trajectories differ. Appends "_bimodal" to the output dir name.')
+@click.option('--bimodal_band', type=float, default=0.2,
+              help='Band width: LOW=[0, band], HIGH=[1-band, 1] (bimodal); '
+                   'the complement [band, 1-band] is the MIDDLE region (--middle).')
+@click.option('--middle', is_flag=True,
+              help='EVAL set for a bimodal-trained model: sample both knobs from the MIDDLE region '
+                   '[band, 1-band] — the gap the bimodal set never covers ("unseen" range). '
+                   'Appends "_middle" to the output dir name.')
+def main(output_dir, num_episodes, seed, n_waypoints, seg_steps, bimodal, bimodal_band, middle):
+    if bimodal and middle:
+        raise click.UsageError("--bimodal and --middle are mutually exclusive (extremes vs. the gap).")
     rng = np.random.default_rng(seed)
+    # Tag the dir so different sampling regimes are never confused.
+    tag = "bimodal" if bimodal else ("middle" if middle else "")
+    if tag and tag not in os.path.basename(output_dir):
+        output_dir = f"{output_dir}_{tag}"
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+    mode = "BIMODAL" if bimodal else ("MIDDLE" if middle else "uniform")
+    print(f"Sampling: {mode}{(' band=%.2f' % bimodal_band) if (bimodal or middle) else ''}  ->  {output_dir}",
+          flush=True)
 
     env = create_wipe_env()
     adim = env.action_dim
@@ -79,9 +99,24 @@ def main(output_dir, num_episodes, seed, n_waypoints, seg_steps):
     out = h5py.File(pathlib.Path(output_dir) / "episodes.hdf5", "w")
     data_grp = out.create_group("data")
 
+    # Bimodal: each knob drawn from LOW=[0, band] or HIGH=[1-band, 1], with the 4
+    # (circ, press) quadrants cycled round-robin so all are balanced (50 each at
+    # n=200). Continuous within a band -> distinct trajectories, but no middle.
+    def _band(is_high):
+        return float(rng.uniform(1.0 - bimodal_band, 1.0) if is_high else rng.uniform(0.0, bimodal_band))
+    quadrants = [(False, False), (False, True), (True, False), (True, True)]  # (circ_high, press_high)
+
     for ep in range(num_episodes):
-        circ_amount = float(rng.uniform(0.0, 1.0))
-        press_amount = float(rng.uniform(0.0, 1.0))
+        if bimodal:
+            circ_high, press_high = quadrants[ep % 4]
+            circ_amount = _band(circ_high)
+            press_amount = _band(press_high)
+        elif middle:
+            circ_amount = float(rng.uniform(bimodal_band, 1.0 - bimodal_band))
+            press_amount = float(rng.uniform(bimodal_band, 1.0 - bimodal_band))
+        else:
+            circ_amount = float(rng.uniform(0.0, 1.0))
+            press_amount = float(rng.uniform(0.0, 1.0))
         obs = env.reset()
         policy = WipeTracePolicy(env, obs["robot0_eef_pos"], circ_amount=circ_amount,
                                  press_amount=press_amount, n_waypoints=n_waypoints, seg_steps=seg_steps)
@@ -122,6 +157,9 @@ def main(output_dir, num_episodes, seed, n_waypoints, seg_steps):
 
     data_grp.attrs["cameras"] = json.dumps(CAMERAS)
     data_grp.attrs["axes"] = json.dumps(["circularity", "wiped_frac"])
+    data_grp.attrs["sampling"] = "bimodal" if bimodal else ("middle" if middle else "uniform")
+    if bimodal or middle:
+        data_grp.attrs["bimodal_band"] = float(bimodal_band)
     out.close()
     print(f"\nWrote {num_episodes} episodes to {output_dir}/episodes.hdf5")
 
