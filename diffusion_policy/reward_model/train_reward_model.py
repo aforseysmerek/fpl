@@ -186,8 +186,30 @@ def load_demo_obs(demo_hdf5, obs_keys, max_demos=None):
               help='Path to pairs.npz from generate_preferences.py — train on those exact '
                    '(idx_a, idx_b, labels) instead of sampling fresh, so the state model uses '
                    'the SAME pairs as the Qwen model. idx index into demos in demo_0..N order.')
+@click.option('--max_train_prefs', default=None, type=int,
+              help='Data-efficiency sweep (only with --load_prefs): cap TRAINING pairs to the '
+                   'first N after the fixed val holdout. Subsets are nested (first-10 ⊂ first-50 ⊂ …) '
+                   'and every N evaluates on the SAME val set. Default: use all remaining pairs.')
+@click.option('--eval_prefs', default=None,
+              help='OPTIONAL out-of-band eval set: path to a second pairs.npz (e.g. from --middle '
+                   'demos). Win rate on it is logged each epoch as reward_model/oos_acc_* — the '
+                   '"unseen" range, alongside the in-band held-out val_acc ("seen" range). '
+                   'Requires --eval_demo_hdf5.')
+@click.option('--eval_demo_hdf5', default=None,
+              help='demos.hdf5 the --eval_prefs idx index into (the middle/unseen demo set).')
+@click.option('--val_ratio', default=0.1, type=float,
+              help='Fraction of the loaded pairs held out for the in-band "seen" val set. '
+                   'e.g. 0.5 on a 200-pair set → 100 val / 100 train pool. Default 0.1.')
+@click.option('--value_metrics', is_flag=True,
+              help='Also log per-trajectory reward-VALUE fidelity (not just pref accuracy): '
+                   'Spearman rho + normalized MSE + a predicted-vs-GT scatter, computed on the '
+                   'FULL train demo set and (if --eval_demo_hdf5 given) the test demo set, each '
+                   'separately. MSE is z-scored on a SHARED scale pooled across both sets, so '
+                   'test/middle values are comparable to the training clusters (interpolation vs '
+                   'collapse). Same every-10-epoch cadence as the distribution plots.')
 def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
-         n_pairs, max_seq_len, stride, max_demos, device, wandb_project, wandb_run_name, reward_axes, load_prefs):
+         n_pairs, max_seq_len, stride, max_demos, device, wandb_project, wandb_run_name, reward_axes,
+         load_prefs, max_train_prefs, eval_prefs, eval_demo_hdf5, val_ratio, value_metrics):
     os.makedirs(output_dir, exist_ok=True)
     obs_keys = obs_keys.split(',')
     device = torch.device(device)
@@ -380,6 +402,19 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
             metric_cols.append(sum(base_axis_values[s] for s in sub) / len(sub))
     metrics = np.stack(metric_cols, axis=-1)  # (N_rollouts + N_demos, K)
 
+    def _gt_metrics(obs_arr, lengths_arr, actions_arr=None):
+        """Oracle axis values (same axes/order as `metrics`) for an arbitrary demo
+        set — used for the --value_metrics per-trajectory comparison on the eval set."""
+        base = {name: np.zeros(len(obs_arr), dtype=np.float32) for name in base_axes_needed}
+        for i in range(len(obs_arr)):
+            L_i = int(lengths_arr[i]); oi = obs_arr[i][:L_i]
+            ai = actions_arr[i][:L_i] if actions_arr is not None else None
+            for name in base_axes_needed:
+                base[name][i] = AXIS_FUNCTIONS[name](oi, actions=ai)
+        cols = [base[p] if kind == 'plain' else sum(base[s] for s in p) / len(p)
+                for kind, p in expanded]
+        return np.stack(cols, axis=-1)
+
     # Convenience pulls used downstream by the histogram plot.
     def _compute_or_default(name):
         if name in base_axis_values:
@@ -418,8 +453,9 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
     wandb.log({'reward_model/gt_distributions': wandb.Image(fig)})
     plt.close(fig)
 
-    # Create train/val datasets (preferences across rollouts AND demos)
-    val_ratio = 0.1
+    # Create train/val datasets (preferences across rollouts AND demos).
+    # val_ratio is the --val_ratio CLI option (fraction held out for the
+    # in-band "seen" val set).
     N_total = len(all_obs)
     all_unique_pairs = N_total * (N_total - 1) // 2
     effective_n_pairs = n_pairs if n_pairs is not None else all_unique_pairs
@@ -439,16 +475,29 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
         _ia, _ib, _lab = _p['idx_a'], _p['idx_b'], _p['labels']
         _nv = min(max(int(len(_ia) * val_ratio), 1), len(_ia) - 1)
 
+        # Val = first _nv pairs (FIXED). Train = the pairs after it. For a
+        # data-efficiency sweep, --max_train_prefs caps the train slice to the
+        # next N — a prefix, so subsets are nested and val is identical across N.
+        _train_sl = slice(_nv, None)
+        if max_train_prefs is not None:
+            _train_sl = slice(_nv, _nv + max_train_prefs)
+
         def _saved_ds(sl, sd):
             _ds = PreferencePairDataset(all_obs, all_lengths, metrics,
                                         max_seq_len=max_seq_len, stride=stride, n_pairs=1, seed=sd)
             _ds.idx_a, _ds.idx_b, _ds.labels = _ia[sl], _ib[sl], _lab[sl]
             return _ds
 
-        train_dataset = _saved_ds(slice(_nv, None), 42)
+        train_dataset = _saved_ds(_train_sl, 42)
         val_dataset = _saved_ds(slice(0, _nv), 123)
-        print(f"  [load_prefs] using {len(_ia)} saved pairs from {load_prefs} "
-              f"({len(_ia) - _nv} train / {_nv} val)")
+        _n_train = len(_ia[_train_sl])
+        print(f"  [load_prefs] {len(_ia)} saved pairs from {load_prefs}; "
+              f"val={_nv} (fixed), train={_n_train}"
+              + (f" [capped at --max_train_prefs {max_train_prefs}]"
+                 if max_train_prefs is not None else " [all remaining]"))
+        if max_train_prefs is not None and _n_train < max_train_prefs:
+            print(f"  [load_prefs] WARNING: only {_n_train} train pairs available "
+                  f"(< requested {max_train_prefs}); using all of them.")
     else:
         train_dataset = PreferencePairDataset(
             all_obs, all_lengths, metrics,
@@ -458,6 +507,34 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
             max_seq_len=max_seq_len, stride=stride, n_pairs=n_val_pairs, seed=123)
     dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    # Optional out-of-band ("unseen") eval set — a SEPARATE demo file + pairs.npz
+    # (e.g. from --middle collection). Scored by the same model each epoch so we
+    # can compare in-band val ("seen" range) vs. this middle-range win rate.
+    eval_dataloader = None
+    _ev_obs = _ev_len = _ev_gt = None   # eval demo set for --value_metrics
+    if eval_prefs is not None:
+        if eval_demo_hdf5 is None:
+            raise click.UsageError("--eval_prefs requires --eval_demo_hdf5")
+        _ev_eps = load_demo_obs(eval_demo_hdf5, obs_keys)
+        if _ev_eps[0].shape[-1] != obs_dim:
+            raise ValueError(f"eval demos obs_dim {_ev_eps[0].shape[-1]} != train obs_dim {obs_dim} "
+                             f"(check --obs_keys / that the eval set was collected the same way)")
+        _ev_len = np.array([len(e) for e in _ev_eps], dtype=np.int32)
+        _ev_obs = np.zeros((len(_ev_eps), int(_ev_len.max()), obs_dim), dtype=np.float32)
+        for i, e in enumerate(_ev_eps):
+            _ev_obs[i, :len(e)] = e
+        _pe = np.load(eval_prefs, allow_pickle=True)
+        eval_ds = PreferencePairDataset(_ev_obs, _ev_len,
+                                        np.zeros((len(_ev_eps), num_rewards), dtype=np.float32),
+                                        max_seq_len=max_seq_len, stride=stride, n_pairs=1, seed=7)
+        eval_ds.idx_a, eval_ds.idx_b, eval_ds.labels = _pe['idx_a'], _pe['idx_b'], _pe['labels']
+        eval_dataloader = DataLoader(eval_ds, batch_size=batch_size, shuffle=False, num_workers=2)
+        print(f"  [eval_prefs] out-of-band eval: {len(_pe['idx_a'])} pairs over "
+              f"{len(_ev_eps)} demos from {eval_prefs}")
+        if value_metrics:
+            _ev_gt = _gt_metrics(_ev_obs, _ev_len)   # oracle axis values per eval trajectory
+            print(f"  [value_metrics] test set = {len(_ev_obs)} eval demos (GT computed)")
 
     # Create model
     model = StateRewardModel(
@@ -525,6 +602,21 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
         val_avg_loss = val_total_loss / val_n_batches
         val_avg_acc = val_total_acc / val_n_batches
 
+        # Out-of-band ("unseen" middle range) win rate, if an eval set was given.
+        # Same forward + BT-accuracy as the val loop above, on the separate set.
+        oos_avg_acc = None
+        if eval_dataloader is not None:
+            oos_total_acc = np.zeros(num_rewards)
+            oos_n_batches = 0
+            with torch.no_grad():
+                for batch in eval_dataloader:
+                    ra = model(batch['obs_a'].to(device), batch['mask_a'].to(device))
+                    rb = model(batch['obs_b'].to(device), batch['mask_b'].to(device))
+                    _, acc_oos = bradley_terry_loss(ra, rb, batch['labels'].to(device))
+                    oos_total_acc += acc_oos.cpu().numpy()
+                    oos_n_batches += 1
+            oos_avg_acc = oos_total_acc / max(oos_n_batches, 1)
+
         # Log to wandb every epoch
         log_dict = {
             'reward_model/train_loss': avg_loss,
@@ -533,9 +625,13 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
             'reward_model/val_acc_mean': val_avg_acc.mean(),
             'reward_model/epoch': epoch + 1,
         }
+        if oos_avg_acc is not None:
+            log_dict['reward_model/oos_acc_mean'] = oos_avg_acc.mean()
         for k, name in enumerate(reward_names):
             log_dict[f'reward_model/train_acc_{name}'] = avg_acc[k]
             log_dict[f'reward_model/val_acc_{name}'] = val_avg_acc[k]
+            if oos_avg_acc is not None:
+                log_dict[f'reward_model/oos_acc_{name}'] = oos_avg_acc[k]
         # Log predicted score distributions every 10 epochs
         if (epoch + 1) % 10 == 0 or epoch == 0 or (epoch + 1) == epochs:
             pred_scores = score_episodes(model, all_obs, all_lengths, max_seq_len, device, stride=stride)
@@ -551,11 +647,47 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
             log_dict['reward_model/pred_distributions'] = wandb.Image(fig)
             plt.close(fig)
 
+            # ---- per-trajectory reward-VALUE fidelity (predicted vs oracle GT) ----
+            if value_metrics:
+                # train predicted = pred_scores (just computed); train GT = metrics.
+                vsets = [("train", pred_scores, metrics)]
+                if _ev_gt is not None:
+                    pred_te = score_episodes(model, _ev_obs, _ev_len, max_seq_len, device, stride=stride)
+                    vsets.append(("test", pred_te, _ev_gt))
+                # SHARED z-score stats pooled across all sets (per axis), so test
+                # values sit on the same scale as train (interpolation vs collapse).
+                pool_p = np.concatenate([s[1] for s in vsets], axis=0)
+                pool_g = np.concatenate([s[2] for s in vsets], axis=0)
+                p_mu, p_sd = pool_p.mean(0), pool_p.std(0) + 1e-8
+                g_mu, g_sd = pool_g.mean(0), pool_g.std(0) + 1e-8
+                for sname, pred, gt in vsets:
+                    pz = (pred - p_mu) / p_sd #standardization as done in fpl
+                    gz = (gt - g_mu) / g_sd
+                    figv, axv = plt.subplots(1, num_rewards, figsize=(4 * num_rewards, 4), squeeze=False)
+                    for k, name in enumerate(reward_names):
+                        rho = _spearman(pred[:, k], gt[:, k])   # rank-based → normalization-invariant
+                        mse = float(np.mean((pz[:, k] - gz[:, k]) ** 2))  # shared-scale value error
+                        log_dict[f'value/{sname}_spearman_{name}'] = rho
+                        log_dict[f'value/{sname}_mse_{name}'] = mse
+                        ax = axv[0, k]
+                        ax.scatter(gz[:, k], pz[:, k], s=10, alpha=0.5, edgecolor='none')
+                        lo = float(min(gz[:, k].min(), pz[:, k].min()))
+                        hi = float(max(gz[:, k].max(), pz[:, k].max()))
+                        ax.plot([lo, hi], [lo, hi], 'k--', lw=1, alpha=0.6)  # y=x reference
+                        ax.set_title(f'{name}  ρ={rho:.2f}  mse={mse:.2f}')
+                        ax.set_xlabel('GT (shared-norm)'); ax.set_ylabel('predicted (shared-norm)')
+                    figv.suptitle(f'{sname}: predicted vs GT reward (epoch {epoch + 1})')
+                    figv.tight_layout()
+                    log_dict[f'value/scatter_{sname}'] = wandb.Image(figv)
+                    plt.close(figv)
+
         wandb.log(log_dict, step=epoch + 1)
 
         acc_str = ', '.join(f'{avg_acc[k]:.3f}' for k in range(num_rewards))
         val_acc_str = ', '.join(f'{val_avg_acc[k]:.3f}' for k in range(num_rewards))
-        print(f"Epoch {epoch+1}/{epochs}  train_loss={avg_loss:.4f}  train_acc=[{acc_str}]  val_loss={val_avg_loss:.4f}  val_acc=[{val_acc_str}]")
+        oos_str = ('  oos_acc(unseen)=[' + ', '.join(f'{oos_avg_acc[k]:.3f}' for k in range(num_rewards)) + ']') \
+            if oos_avg_acc is not None else ''
+        print(f"Epoch {epoch+1}/{epochs}  train_loss={avg_loss:.4f}  train_acc=[{acc_str}]  val_loss={val_avg_loss:.4f}  val_acc(seen)=[{val_acc_str}]{oos_str}")
 
     # Save model
     ckpt_path = os.path.join(output_dir, 'reward_model.pt')
@@ -619,6 +751,21 @@ def main(rollout_data, demo_hdf5, output_dir, obs_keys, epochs, batch_size, lr,
     wandb.summary['scoring/n_rollouts'] = len(rollout_scores)
     wandb.summary['scoring/n_demos'] = len(demo_scores)
     wandb.finish()
+
+
+def _spearman(a, b):
+    """Spearman rank correlation. Uses scipy rankdata (tie-aware) if available,
+    else numpy ordinal ranks. Returns 0.0 for degenerate (constant) inputs."""
+    a = np.asarray(a, dtype=np.float64); b = np.asarray(b, dtype=np.float64)
+    if len(a) < 2 or a.std() < 1e-12 or b.std() < 1e-12:
+        return 0.0
+    try:
+        from scipy.stats import rankdata
+        ra, rb = rankdata(a), rankdata(b)
+    except Exception:
+        ra = np.argsort(np.argsort(a)).astype(np.float64)
+        rb = np.argsort(np.argsort(b)).astype(np.float64)
+    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def score_episodes(model, obs, episode_lengths, max_seq_len, device, batch_size=64, stride=1):
