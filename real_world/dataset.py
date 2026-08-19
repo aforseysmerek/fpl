@@ -31,6 +31,42 @@ def _resolve_iris_path(path: str) -> str:
     return "/hai/scratch/marcelto/data/" + path[len("/iris/u/"):]
 
 
+def _split_h5_ref(ref: str) -> tuple:
+    """Split 'file.hdf5#demo_key' into (file, demo_key).
+
+    A ref without a fragment returns (ref, None) and the caller falls back to
+    the file's first data/<demo> group (the original one-episode-per-file
+    behavior). The fragment form lets pair manifests index episodes INSIDE the
+    original multi-episode episodes.hdf5 directly — no per-episode copies."""
+    if "#" in ref:
+        p, k = ref.split("#", 1)
+        return p, (k or None)
+    return ref, None
+
+
+def traj_identity(sample: dict, side: str):
+    """Canonical identity of one side of a pair sample, for deduping episodes
+    that recur across many pairs. Precedence:
+      1. '<file>#<demo_key>' refs (indexed layout / --episodes): (file, demo_key).
+      2. demo_idx present (generated manifests, copied-file layout — the same
+         demo copied into several pair dirs has DIFFERENT paths but the same
+         demo_idx): (source collection root, demo_idx), so copies merge but
+         equal indices from different collections don't collide.
+      3. otherwise (real-robot sessions): the file path.
+    Returns None if the sample has no hdf5 ref for this side.
+    """
+    ref = sample.get(f"hdf5_{side}")
+    if ref is None:
+        return None
+    path, key = _split_h5_ref(ref)
+    if key is not None:
+        return (path, key)
+    di = sample.get(f"demo_idx_{side}")
+    if di is not None:
+        return (sample.get("src_root"), di)
+    return path
+
+
 def _strided_indices(total: int, stride: int, seq_len: int, offset: int) -> list:
     """Return up to seq_len frame indices starting at offset with the given stride."""
     return list(range(offset, total, stride))[:seq_len]
@@ -42,9 +78,13 @@ def _resize_frames(frames: np.ndarray, img_size: tuple) -> np.ndarray:
 
 
 def _load_raw_hdf5(hdf5_path: str, action_chunk_size: int = 0) -> dict:
-    """Load all raw data from an HDF5 file once. Returns a dict with numpy arrays."""
-    with h5py.File(hdf5_path, "r") as f:
-        demo_key = next(iter(f["data"].keys()))
+    """Load all raw data from an HDF5 file once. Returns a dict with numpy arrays.
+
+    hdf5_path may carry a '#demo_key' fragment selecting an episode inside a
+    multi-episode file; without one, the first data/<demo> group is used."""
+    path, key = _split_h5_ref(hdf5_path)
+    with h5py.File(path, "r") as f:
+        demo_key = key if key is not None else next(iter(f["data"].keys()))
         obs = f[f"data/{demo_key}/obs"]
         raw = {
             "agent_view": obs["agent_view"][:],   # (total, H, W, 3) uint8
@@ -240,6 +280,22 @@ def parse_preference_labels(preferences: dict, preference_keys: list) -> torch.T
     return torch.tensor(labels, dtype=torch.float32)
 
 
+def parse_rollout_extras(info: dict) -> dict:
+    """Optional per-rollout metadata from a preference JSON's rollout_A/rollout_B
+    block (written by generate_preferences.py):
+      gt_metrics: {axis phrase: oracle value} — used by --value_metrics
+      demo_idx:   source episode index — used to dedupe trajectories shared
+                  across many pairs
+    Keys are lowercased to match how preference keys are handled everywhere else.
+    Both fields are optional; missing → None."""
+    if not isinstance(info, dict):
+        return {"gt": None, "demo_idx": None}
+    gm = info.get("gt_metrics")
+    gt = {str(k).lower(): float(v) for k, v in gm.items()} if isinstance(gm, dict) else None
+    di = info.get("demo_idx")
+    return {"gt": gt, "demo_idx": int(di) if di is not None else None}
+
+
 class PreferenceDataset(Dataset):
     """
     Dataset of pairwise trajectory comparisons.
@@ -329,6 +385,8 @@ class PreferenceDataset(Dataset):
 
             succeeded_a = meta["rollout_A"].get("succeeded", None)
             succeeded_b = meta["rollout_B"].get("succeeded", None)
+            extras_a = parse_rollout_extras(meta["rollout_A"])
+            extras_b = parse_rollout_extras(meta["rollout_B"])
 
             self.samples.append({
                 "hdf5_a": hdf5_a,
@@ -339,6 +397,11 @@ class PreferenceDataset(Dataset):
                 "raw_preferences": meta["preferences"],
                 "succeeded_a": torch.tensor(1 if succeeded_a is True else (0 if succeeded_a is False else -1), dtype=torch.int8),
                 "succeeded_b": torch.tensor(1 if succeeded_b is True else (0 if succeeded_b is False else -1), dtype=torch.int8),
+                # value-metrics metadata; read from .samples directly, never collated
+                "gt_a": extras_a["gt"], "gt_b": extras_b["gt"],
+                "demo_idx_a": extras_a["demo_idx"], "demo_idx_b": extras_b["demo_idx"],
+                # collection tree this pair came from; scopes demo_idx in traj_identity
+                "src_root": os.path.dirname(os.path.abspath(d)),
             })
 
             log_every = 1 if preload else 20
@@ -398,12 +461,13 @@ def print_dataset_stats(train_ds: "PreferenceDataset", val_ds: "PreferenceDatase
     def collect_lengths(ds):
         lengths = []
         for s in ds.samples:
-            for path in (s["hdf5_a"], s["hdf5_b"]):
+            for ref in (s["hdf5_a"], s["hdf5_b"]):
                 try:
+                    path, key = _split_h5_ref(ref)
                     with h5py.File(path, "r") as f:
-                        demo_key = next(iter(f["data"].keys()))
+                        demo_key = key if key is not None else next(iter(f["data"].keys()))
                         lengths.append(f[f"data/{demo_key}/obs/agent_view"].shape[0])
-                except OSError:
+                except (OSError, KeyError):
                     pass
         return lengths
 
@@ -438,6 +502,8 @@ def make_datasets(
     preload_offsets: int = 5,
     only_large: bool = False,
     preference_keys: Optional[list] = None,
+    ordered_split: bool = False,
+    max_train_prefs: Optional[int] = None,
 ) -> tuple[PreferenceDataset, PreferenceDataset]:
     """
     Randomly assign val_fraction of preference sessions to validation and the
@@ -446,6 +512,18 @@ def make_datasets(
 
     If preference_keys is provided it overrides the TASKS lookup (used for
     --task auto, where keys come from the data itself).
+
+    ordered_split: instead of a seeded random permutation, val = the FIRST
+    n_val sessions in sorted (filename) order and train = the rest. For
+    generate_preferences.py output (pair_00000...) this makes the val set
+    contain exactly the same pairs as the state trainer's --load_prefs fixed
+    holdout, so win rates are compared on identical pairs.
+
+    max_train_prefs: cap train sessions to the first N after the val holdout
+    (a prefix, so data-efficiency subsets are nested and val is identical
+    across N — same flag name and semantics as the state trainer's
+    --max_train_prefs). Applied before loading so preload doesn't waste time
+    on unused pairs.
     """
     if preference_keys is None:
         if task not in TASKS:
@@ -459,16 +537,28 @@ def make_datasets(
         for d in os.listdir(root)
         if os.path.isdir(os.path.join(root, d))
     )
-    
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(len(dirs))
-    n_val = max(1, int(len(dirs) * val_fraction))
 
-    val_dirs   = [dirs[i] for i in perm[:n_val]]
-    train_dirs = [dirs[i] for i in perm[n_val:]]
+    n_val = max(1, int(len(dirs) * val_fraction))
+    n_val = min(n_val, max(len(dirs) - 1, 1))
+    if ordered_split:
+        val_dirs   = dirs[:n_val]
+        train_dirs = dirs[n_val:]
+    else:
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(len(dirs))
+        val_dirs   = [dirs[i] for i in perm[:n_val]]
+        train_dirs = [dirs[i] for i in perm[n_val:]]
+    if max_train_prefs is not None:
+        if len(train_dirs) > max_train_prefs:
+            train_dirs = train_dirs[:max_train_prefs]
+        else:
+            print(f"[make_datasets] WARNING: only {len(train_dirs)} train sessions available "
+                  f"(< requested max_train_prefs={max_train_prefs}); using all of them.")
 
     print(f"Task: {task} | Keys: {preference_keys}")
-    print(f"Train: {len(train_dirs)} sessions, Val: {len(val_dirs)} sessions")
+    print(f"Train: {len(train_dirs)} sessions, Val: {len(val_dirs)} sessions"
+          + (" [ordered split: heldout = first sessions]" if ordered_split else "")
+          + (f" [train capped at {max_train_prefs}]" if max_train_prefs is not None else ""))
 
     train_ds = PreferenceDataset(train_dirs, preference_keys=preference_keys, stride=stride, seq_len=seq_len, img_size=img_size, training=True,  preload=preload, action_chunk_size=action_chunk_size, preload_offsets=preload_offsets, only_large=only_large)
     val_ds   = PreferenceDataset(val_dirs,   preference_keys=preference_keys, stride=stride, seq_len=seq_len, img_size=img_size, training=False, preload=preload, action_chunk_size=action_chunk_size, preload_offsets=preload_offsets, only_large=only_large)
@@ -548,23 +638,35 @@ def load_cross_preferences(
         id_b = meta.get("rollout_B_id")
 
         if id_a is not None and id_b is not None:
-            # Direct-path mode: resolve to .hdf5 file
-            hdf5_a = id_a if id_a.endswith(".hdf5") else id_a + ".hdf5"
-            hdf5_b = id_b if id_b.endswith(".hdf5") else id_b + ".hdf5"
-            hdf5_a = _resolve_iris_path(hdf5_a)
-            hdf5_b = _resolve_iris_path(hdf5_b)
-            if not os.path.exists(hdf5_a):
+            # Direct-path mode. Ids may carry a '#demo_key' fragment selecting an
+            # episode inside a multi-episode file (the indexed layout from
+            # generate_preferences.py, e.g. "../../episodes.hdf5#demo_42").
+            # Relative paths resolve against the dir holding the JSON, so the
+            # tree works unchanged after moving to another machine.
+            def _resolve_id(rid):
+                p, k = _split_h5_ref(rid)
+                p = p if p.endswith(".hdf5") else p + ".hdf5"
+                if not os.path.isabs(p):
+                    p = os.path.normpath(os.path.join(cross_dir, p))
+                p = _resolve_iris_path(p)
+                return p, k
+
+            path_a, key_a = _resolve_id(id_a)
+            path_b, key_b = _resolve_id(id_b)
+            if not os.path.exists(path_a):
                 print(f"[cross_preferences] Skipping {os.path.basename(cross_file)}: "
-                      f"rollout_A_id path not found: {hdf5_a}")
+                      f"rollout_A_id path not found: {path_a}")
                 n_skip += 1
                 continue
-            if not os.path.exists(hdf5_b):
+            if not os.path.exists(path_b):
                 print(f"[cross_preferences] Skipping {os.path.basename(cross_file)}: "
-                      f"rollout_B_id path not found: {hdf5_b}")
+                      f"rollout_B_id path not found: {path_b}")
                 n_skip += 1
                 continue
-            succeeded_a = None
-            succeeded_b = None
+            hdf5_a = path_a + (f"#{key_a}" if key_a else "")
+            hdf5_b = path_b + (f"#{key_b}" if key_b else "")
+            succeeded_a = meta.get("rollout_A", {}).get("succeeded", None)
+            succeeded_b = meta.get("rollout_B", {}).get("succeeded", None)
         else:
             # Timestamp-lookup mode
             ts_a = meta.get("rollout_A_timestamp")
@@ -584,11 +686,13 @@ def load_cross_preferences(
             hdf5_a, succeeded_a = ts_map[ts_a]
             hdf5_b, succeeded_b = ts_map[ts_b]
 
-        # Validate that both HDF5 files can be opened.
+        # Validate that both HDF5 files can be opened (and, for '#demo_key'
+        # refs, that the referenced episode actually exists).
         try:
-            for path in (hdf5_a, hdf5_b):
+            for ref in (hdf5_a, hdf5_b):
+                path, key = _split_h5_ref(ref)
                 with h5py.File(path, "r") as f:
-                    demo_key = next(iter(f["data"].keys()))
+                    demo_key = key if key is not None else next(iter(f["data"].keys()))
                     _ = f[f"data/{demo_key}/obs/agent_view"].shape
         except (OSError, KeyError) as e:
             print(f"[cross_preferences] Skipping {os.path.basename(cross_file)}: "
@@ -598,6 +702,8 @@ def load_cross_preferences(
 
         labels = parse_preference_labels(meta["preferences"], preference_keys)
         session = meta.get("session_timestamp", os.path.basename(cross_file))
+        extras_a = parse_rollout_extras(meta.get("rollout_A", {}))
+        extras_b = parse_rollout_extras(meta.get("rollout_B", {}))
 
         samples.append({
             "hdf5_a": hdf5_a,
@@ -606,6 +712,10 @@ def load_cross_preferences(
             "session": session,
             "instruction": meta.get("instruction", ""),
             "raw_preferences": meta["preferences"],
+            "gt_a": extras_a["gt"], "gt_b": extras_b["gt"],
+            "demo_idx_a": extras_a["demo_idx"], "demo_idx_b": extras_b["demo_idx"],
+            # manifest dir this pair came from; scopes demo_idx in traj_identity
+            "src_root": os.path.abspath(cross_dir),
             "succeeded_a": torch.tensor(
                 1 if succeeded_a is True else (0 if succeeded_a is False else -1),
                 dtype=torch.int8,
@@ -624,6 +734,86 @@ def load_cross_preferences(
           f"({len(unique_paths)} unique trajectories), "
           f"skipped {n_skip} out of {len(cross_files)} files")
     return samples
+
+
+def build_pairs_from_episodes(
+    episodes_path: str,
+    reward_axes: str,
+    n_pairs: Optional[int],
+    seed: int,
+    n_episodes: Optional[int] = None,
+) -> tuple:
+    """Generate preference pairs ON THE FLY from a multi-episode episodes.hdf5.
+
+    Uses the SAME oracle (reward_functions.compute_axes), the SAME sampler
+    (sample_pair_indices) and labeling as generate_preferences.py / the state
+    trainer — one shared implementation, so identical (episodes, n_pairs,
+    seed, n_episodes) produce identical pairs with no files to carry them.
+
+    Returns (samples, preference_keys):
+      samples: PreferenceDataset.samples-format dicts whose hdf5 refs point
+               into the episodes file in place ('<abspath>#demo_key'), with
+               labels, succeeded, demo_idx and gt (oracle values) filled in.
+      preference_keys: lowercased axis prompt phrases, in axis order.
+    """
+    # Both modules are numpy-only; import them from the sibling
+    # diffusion_policy tree so there is exactly one oracle + one sampler.
+    rm_dir = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "diffusion_policy", "reward_model"))
+    if rm_dir not in sys.path:
+        sys.path.insert(0, rm_dir)
+    from reward_functions import compute_axes
+    from preferences import AXIS_PROMPT, sample_pair_indices, preference_pair_labels
+
+    axes = [a.strip() for a in reward_axes.split(",") if a.strip()]
+    prompts = [AXIS_PROMPT.get(a, a) for a in axes]
+    preference_keys = [p.lower() for p in prompts]
+
+    ep_abs = os.path.abspath(episodes_path)
+    demo_keys, metrics_rows, succeeded = [], [], []
+    with h5py.File(ep_abs, "r") as f:
+        keys = sorted(f["data"].keys(), key=lambda s: int(s.split("_")[1]))
+        if n_episodes is not None:
+            assert n_episodes <= len(keys), "n_episodes exceeds total episodes available"
+            keys = keys[:n_episodes]
+        for k in keys:
+            g = f["data"][k]
+            state = g["obs"]["state_lowdim"][:].astype(np.float32)
+            actions = g["actions"][:].astype(np.float32)
+            vals = compute_axes(axes, state, actions=actions)
+            demo_keys.append(k)
+            metrics_rows.append([vals[a] for a in axes])
+            succeeded.append(bool(g.attrs.get("success", True)))
+    metrics = np.asarray(metrics_rows, dtype=np.float32)
+
+    idx_a, idx_b = sample_pair_indices(len(demo_keys), n_pairs, seed)
+    labels = preference_pair_labels(metrics, idx_a, idx_b)
+
+    def side(idx):
+        gt = {preference_keys[k]: float(metrics[idx, k]) for k in range(len(axes))}
+        return f"{ep_abs}#{demo_keys[idx]}", gt, int(idx), succeeded[idx]
+
+    samples = []
+    for i in range(len(idx_a)):
+        a, b = int(idx_a[i]), int(idx_b[i])
+        ref_a, gt_a, di_a, suc_a = side(a)
+        ref_b, gt_b, di_b, suc_b = side(b)
+        samples.append({
+            "hdf5_a": ref_a,
+            "hdf5_b": ref_b,
+            "labels": torch.tensor(labels[i], dtype=torch.float32),
+            "session": f"pair_{i:05d}",
+            "instruction": "",
+            "raw_preferences": {},
+            "succeeded_a": torch.tensor(1 if suc_a else 0, dtype=torch.int8),
+            "succeeded_b": torch.tensor(1 if suc_b else 0, dtype=torch.int8),
+            "gt_a": gt_a, "gt_b": gt_b,
+            "demo_idx_a": di_a, "demo_idx_b": di_b,
+            "src_root": ep_abs,
+        })
+    print(f"[episodes] Generated {len(samples)} pairs over axes {axes} from "
+          f"{len(demo_keys)} episodes in {ep_abs} (seed={seed})")
+    return samples, preference_keys
 
 
 def load_anchors(

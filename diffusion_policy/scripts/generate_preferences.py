@@ -32,21 +32,13 @@ import click
 import numpy as np
 import h5py
 
-from reward_functions import compute_axes                    # THEIR metric functions
+from reward_functions import compute_axes                     # THEIR metric functions
+from preferences import AXIS_PROMPT                           # axis → prompt phrase map
 from train_reward_model import PreferencePairDataset          # THEIR pair generator
 
 # state_lowdim = concat(object, robot0_eef_pos(3), robot0_eef_quat(4), robot0_gripper_qpos(2))
 # — split it back into their per-key demo layout (object = everything before the last 9).
 OBS_TAIL = [("robot0_eef_pos", 3), ("robot0_eef_quat", 4), ("robot0_gripper_qpos", 2)]
-
-# readable prompts for the language-conditioned Qwen model (edit as you like).
-# These strings are the axis DESCRIPTION the VLM is conditioned on — one fixed
-# phrase per axis, inserted into "What is the score for '<phrase>' in this
-# trajectory?". They are NOT per-trajectory labels.
-AXIS_PROMPT = {"speed_reward": "completes the task quickly", "smoothness": "smoothness",
-               "peg_reward": "places the nut on the right-hand peg", "success": "task success",
-               "circularity": "wipes in circular scrubbing motions",
-               "wiped_frac": "the spill is wiped clean"}
 
 
 def load_episodes(path, n_episodes):
@@ -59,6 +51,7 @@ def load_episodes(path, n_episodes):
         for k in keys:
             g = f["data"][k]
             demos.append(dict(
+                key=k,   # HDF5 group name, for in-place '#demo_key' references
                 state=g["obs"]["state_lowdim"][:].astype(np.float32),
                 actions=g["actions"][:].astype(np.float32),
                 agent_view=g["obs"]["agent_view"][:],
@@ -91,8 +84,14 @@ def split_state(state):
 @click.option("--stride", type=int, default=1)
 @click.option("--save_state", default=None, help="dir for demos.hdf5 + pairs.npz (state model)")
 @click.option("--save_qwen", default=None, help="dir for co-located pair dirs (qwen)")
+@click.option("--save_qwen_indexed", default=None,
+              help="dir for the INDEXED qwen layout: writes ONLY tiny DIR/pairs/preference_*.json "
+                   "manifests that reference episodes IN PLACE inside the source episodes.hdf5 "
+                   "(relative path + '#demo_key'). No HDF5 is re-saved. Upload episodes.hdf5 + "
+                   "DIR/pairs keeping relative positions. Train with: "
+                   "--preferences_dir '' --cross_preferences_dir DIR/pairs")
 @click.option("--task_prompt", default="place the square nut on the peg")
-def main(episodes, reward_axes, n_pairs, n_episodes, seed, max_seq_len, stride, save_state, save_qwen, task_prompt):
+def main(episodes, reward_axes, n_pairs, n_episodes, seed, max_seq_len, stride, save_state, save_qwen, save_qwen_indexed, task_prompt):
     axes = [a.strip() for a in reward_axes.split(",")]
     demos = load_episodes(episodes, n_episodes)
     N = len(demos)
@@ -139,9 +138,8 @@ def main(episodes, reward_axes, n_pairs, n_episodes, seed, max_seq_len, stride, 
         print(f"        train: python reward_model/train_reward_model.py --rollout_data none "
               f"--demo_hdf5 {d}/demos.hdf5 --reward_axes {reward_axes} --load_prefs {d}/pairs.npz --output_dir <out>")
 
-    # ---- qwen: co-located pair dirs with images ----
-    if save_qwen:
-        outroot = pathlib.Path(save_qwen); outroot.mkdir(parents=True, exist_ok=True)
+    # ---- qwen: shared helpers for both layouts ----
+    if save_qwen or save_qwen_indexed:
         prompts = [AXIS_PROMPT.get(a, a) for a in axes]
 
         def write_rollout(p, dm):
@@ -151,21 +149,61 @@ def main(episodes, reward_axes, n_pairs, n_episodes, seed, max_seq_len, stride, 
                 og.create_dataset("wrist", data=dm["wrist"])
                 og.create_dataset("JOINT_POS", data=dm["joint_pos"])
 
+        def rollout_info(idx):
+            """Per-rollout block for preference.json: success flag + the source
+            demo index (for trajectory dedup) + the oracle axis values (for
+            --value_metrics in the qwen trainer), keyed by the axis prompt."""
+            return {"succeeded": demos[idx]["success"],
+                    "demo_idx": int(idx),
+                    "gt_metrics": {prompts[k]: float(metrics[idx, k]) for k in range(len(axes))}}
+
+        def pair_prefs(i):
+            return {prompts[k]: ("A" if labels[i, k] == 1.0 else "B" if labels[i, k] == 0.0 else "Equal")
+                    for k in range(len(axes))}
+
+    # ---- qwen (co-located): pair dirs, each with its own copies of the images ----
+    if save_qwen:
+        outroot = pathlib.Path(save_qwen); outroot.mkdir(parents=True, exist_ok=True)
         for i in range(len(idx_a)):
             a, b = int(idx_a[i]), int(idx_b[i])
             pd = outroot / f"pair_{i:05d}"; pd.mkdir(exist_ok=True)
             write_rollout(pd / "rollout_A.hdf5", demos[a])
             write_rollout(pd / "rollout_B.hdf5", demos[b])
-            prefs = {prompts[k]: ("A" if labels[i, k] == 1.0 else "B" if labels[i, k] == 0.0 else "Equal")
-                     for k in range(len(axes))}
-            json.dump(dict(preferences=prefs,
-                           rollout_A={"succeeded": demos[a]["success"]},
-                           rollout_B={"succeeded": demos[b]["success"]},
+            json.dump(dict(preferences=pair_prefs(i),
+                           rollout_A=rollout_info(a),
+                           rollout_B=rollout_info(b),
                            instruction=task_prompt, session_timestamp=f"pair_{i:05d}"),
                       open(pd / "preference.json", "w"), indent=2)
         print(f"[qwen]  -> {outroot} ({len(idx_a)} pair dirs)")
         print(f"        train (qwen_rl): python train_reward_model.py --model qwen_open --use_lora "
               f"--task auto --preferences_dir {outroot.resolve()} --epochs 30 --batch_size 1")
+
+    # ---- qwen (indexed): manifests ONLY — episodes referenced in place ----
+    # No HDF5 is written at all: each manifest points into the source
+    # episodes.hdf5 with a '#demo_key' fragment. Upload episodes.hdf5 + this
+    # pairs/ dir, keeping their relative positions (paths are relative).
+    if save_qwen_indexed:
+        pairs_dir = pathlib.Path(save_qwen_indexed) / "pairs"
+        pairs_dir.mkdir(parents=True, exist_ok=True)
+        ep_rel = os.path.relpath(os.path.abspath(episodes), start=str(pairs_dir))
+
+        def ref(idx):
+            return f"{ep_rel}#{demos[idx]['key']}"
+
+        for i in range(len(idx_a)):
+            a, b = int(idx_a[i]), int(idx_b[i])
+            json.dump(dict(preferences=pair_prefs(i),
+                           rollout_A_id=ref(a),
+                           rollout_B_id=ref(b),
+                           rollout_A=rollout_info(a),
+                           rollout_B=rollout_info(b),
+                           instruction=task_prompt, session_timestamp=f"pair_{i:05d}"),
+                      open(pairs_dir / f"preference_{i:05d}.json", "w"), indent=2)
+        print(f"[qwen_indexed] -> {pairs_dir} ({len(idx_a)} pair manifests; episodes "
+              f"referenced in place as '{ep_rel}#<demo>' — no HDF5 re-saved)")
+        print(f"        train (qwen_rl): python train_reward_model.py --model qwen_open --use_lora "
+              f"--task auto --preferences_dir '' --cross_preferences_dir {pairs_dir.resolve()} "
+              f"--epochs 30 --batch_size 1   # split is ordered automatically for generated manifests")
 
 
 if __name__ == "__main__":
