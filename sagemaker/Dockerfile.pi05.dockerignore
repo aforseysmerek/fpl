@@ -1,0 +1,11 @@
+# Context filter for Dockerfile.pi05 only (BuildKit per-Dockerfile ignore).
+# Allowlist: the vendored openpi tree + the pi05 entrypoint, nothing else.
+*
+!real_world/openpi
+real_world/openpi/.venv
+real_world/openpi/checkpoints
+real_world/openpi/assets
+real_world/openpi/data
+real_world/openpi/wandb
+real_world/openpi/**/__pycache__
+!sagemaker/train_entry_pi05.py

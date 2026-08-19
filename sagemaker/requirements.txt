@@ -1,0 +1,14 @@
+# Pinned to match the working local qwen_rl env (2026-07-21).
+# torch / torchvision / flash-attn intentionally absent: the AWS DLC base image
+# provides them (torch 2.8 + cu129); qwen_model.py falls back to sdpa if
+# flash-attn is unusable.
+transformers @ git+https://github.com/huggingface/transformers.git@0bc355418bb265136a66c2dedc501066ffbc237d
+peft==0.19.1
+accelerate==1.14.0
+h5py==3.16.0
+# no numpy pin: the DLC base ships numpy 2.x and its scipy/sklearn are built
+# against it; downgrading numpy breaks the transformers -> sklearn import chain
+opencv-python-headless==4.11.0.86
+matplotlib==3.10.9
+wandb==0.27.2
+einops==0.8.2

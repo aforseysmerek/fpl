@@ -1,0 +1,8 @@
+# One run per line; each line is an arg string for train_reward_model.py.
+# Lines run one-per-GPU (waves of 8 on a p5). '#' lines and blanks are skipped.
+# {data} -> input channel, {out} -> /opt/ml/checkpoints, {i} -> run index.
+# --preferences_dir/{data} and --out_dir/{out}/runNN are auto-appended if omitted.
+--task auto --use_lora --lora_r 64 --lora_alpha 16 --epochs 50 --wandb_run_name lora_r64
+--task auto --use_lora --lora_r 32 --lora_alpha 16 --epochs 50 --wandb_run_name lora_r32
+--task auto --use_lora --lora_r 64 --lora_alpha 32 --epochs 50 --wandb_run_name lora_r64_a32
+--task auto --use_lora --lora_r 64 --lora_alpha 16 --epochs 50 --tune_vision --wandb_run_name lora_r64_vision

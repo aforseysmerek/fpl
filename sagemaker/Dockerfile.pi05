@@ -1,0 +1,42 @@
+# SageMaker training image for the pi0.5 reward-conditioned finetune.
+# Mirrors openpi's own docker recipe (scripts/docker/serve_policy.Dockerfile):
+# same CUDA base + uv; env built with the authors' install commands.
+# Build context = repo root, filtered by Dockerfile.pi05.dockerignore:
+#   docker build -f sagemaker/Dockerfile.pi05 -t <name> .
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
+
+# openpi requirements (their Dockerfile) + LeRobot's git-lfs dependency
+# + opencv-python's native libs (libGL/libglib), which DataLoader workers
+# import at spawn.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git git-lfs build-essential clang libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV UV_LINK_MODE=copy
+# uv sync honors UV_PROJECT_ENVIRONMENT; uv pip only finds the env via
+# VIRTUAL_ENV (or a local .venv), so both must point at /opt/venv.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+
+COPY real_world/openpi/ /opt/ml/code/openpi/
+WORKDIR /opt/ml/code/openpi
+# The authors' env setup, verbatim (uv fetches its own Python per the lockfile).
+RUN GIT_LFS_SKIP_SMUDGE=1 uv sync \
+    && GIT_LFS_SKIP_SMUDGE=1 uv pip install -e . \
+    && uv pip install sagemaker-training \
+    && uv pip install protobuf==4.25.8 cffi==1.17.1 \
+    && uv cache clean
+# ^ sagemaker-training upgrades protobuf (4.25.8 -> 7.x) and cffi past the
+#   lockfile pins; protobuf 7.x breaks wandb's generated protos at import.
+#   Restore the locked versions after it installs.
+
+ENV PATH=/opt/venv/bin:$PATH
+
+# Fail at build, not on the queue, if the stack is broken (CPU-only here):
+# importing scripts/train.py executes the full import chain the job runs.
+RUN JAX_PLATFORMS=cpu python -c "import sagemaker_training, sys, jax; sys.path.insert(0, 'scripts'); import train; print('pi05 image OK | jax', jax.__version__)"
+
+COPY sagemaker/train_entry_pi05.py /opt/ml/code/train_entry_pi05.py
+ENV SAGEMAKER_SUBMIT_DIRECTORY=/opt/ml/code
+ENV SAGEMAKER_PROGRAM=train_entry_pi05.py
