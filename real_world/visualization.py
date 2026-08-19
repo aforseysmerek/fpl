@@ -16,6 +16,7 @@ import matplotlib.patches as mpatches
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 import numpy as np
 import torch
+from dataset import traj_identity
 from flow_model import RewardModel as FlowRewardModel
 
 
@@ -33,6 +34,8 @@ def visualize_validation_batch(
     max_samples: int = 8,
     step: int = 0,
     fps: int = 10,
+    axis_keys: list = None,
+    open_axis: bool = False,
 ):
     """
     For up to `max_samples` validation items, save an animated GIF showing:
@@ -55,6 +58,12 @@ def visualize_validation_batch(
             labels = item["labels"]  # (K,)
             gt_vals = labels.numpy()
 
+            # Axis display names + which axes are informative for this pair.
+            axis_names = list(axis_keys) if axis_keys is not None else list(preference_keys)
+            shown = [k for k in range(len(axis_names)) if float(gt_vals[k]) != 0.5]
+            if not shown:
+                continue  # GT Equal on every axis - nothing informative to render
+
             # (T, 3, H, W) uint8 — kept as-is for display; normalized separately for model
             tp_a_frames = item["traj_a"]["third_person"]
             wr_a_frames = item["traj_a"]["wrist"]
@@ -75,8 +84,22 @@ def visualize_validation_batch(
             else:
                 mask_a = _to_batch(item["traj_a"]["padding_mask"])
                 mask_b = _to_batch(item["traj_b"]["padding_mask"])
-                r_a = model(_to_batch(tp_a_frames), _to_batch(wr_a_frames), mask_a)
-                r_b = model(_to_batch(tp_b_frames), _to_batch(wr_b_frames), mask_b)
+                if open_axis:
+                    # 1-head language model: one forward per axis prompt, so each
+                    # panel shows the score under ITS phrase.
+                    r_a = torch.stack([
+                        model(_to_batch(tp_a_frames), _to_batch(wr_a_frames), mask_a,
+                              axis_labels=[axis_names[k]]).reshape(-1)[0]
+                        for k in range(len(axis_names))
+                    ]).unsqueeze(0)
+                    r_b = torch.stack([
+                        model(_to_batch(tp_b_frames), _to_batch(wr_b_frames), mask_b,
+                              axis_labels=[axis_names[k]]).reshape(-1)[0]
+                        for k in range(len(axis_names))
+                    ]).unsqueeze(0)
+                else:
+                    r_a = model(_to_batch(tp_a_frames), _to_batch(wr_a_frames), mask_a)
+                    r_b = model(_to_batch(tp_b_frames), _to_batch(wr_b_frames), mask_b)
             r_a_np = r_a.squeeze(0).cpu().numpy()   # (K,)
             r_b_np = r_b.squeeze(0).cpu().numpy()   # (K,)
             prob_a = 1.0 / (1.0 + np.exp(-(r_a_np - r_b_np)))  # sigmoid(r_A - r_B)
@@ -95,7 +118,8 @@ def visualize_validation_batch(
             ax_wr_a = fig.add_subplot(gs[0, 1])
             ax_tp_b = fig.add_subplot(gs[0, 2])
             ax_wr_b = fig.add_subplot(gs[0, 3])
-            ax_bar  = fig.add_subplot(gs[1, :])
+            sub = gs[1, :].subgridspec(1, len(shown), wspace=0.3)
+            axis_axes = [fig.add_subplot(sub[0, j]) for j in range(len(shown))]
 
             for ax, title in zip(
                 [ax_tp_a, ax_wr_a, ax_tp_b, ax_wr_b],
@@ -110,58 +134,29 @@ def visualize_validation_batch(
             im_tp_b = ax_tp_b.imshow(_to_img(tp_b_frames[0]))
             im_wr_b = ax_wr_b.imshow(_to_img(wr_b_frames[0]))
 
-            # ---- bar chart (static, drawn once) ----
-            x = np.arange(K)
-            width = 0.25
-
-            bars_ra = ax_bar.bar(x - width, r_a_np, width, label="r_A", color="steelblue",   alpha=0.85)
-            bars_rb = ax_bar.bar(x,          r_b_np, width, label="r_B", color="darkorange",  alpha=0.85)
-            bars_pa = ax_bar.bar(x + width,  prob_a, width, label="P(A>B)", color="gray",     alpha=0.6)
-
-            # Color P(A>B) bar green=correct, red=wrong, gray=Equal GT
-            pred_label = ["A" if p > 0.5 else ("B" if p < 0.5 else "=") for p in prob_a]
-            gt_label   = ["A" if v == 1.0 else ("B" if v == 0.0 else "=") for v in gt_vals]
-            for bar, pred, gt in zip(bars_pa, pred_label, gt_label):
-                if gt == "=":
-                    bar.set_facecolor("gray")
-                elif pred == gt:
-                    bar.set_facecolor("mediumseagreen")
-                else:
-                    bar.set_facecolor("firebrick")
-
-            ax_bar.set_xticks(x)
-            ax_bar.set_xticklabels(preference_keys, fontsize=9)
-            all_vals = np.concatenate([r_a_np, r_b_np, prob_a])
-            ax_bar.set_ylim(min(0, all_vals.min() - 0.1), all_vals.max() + 0.2)
-            ax_bar.axhline(0.5, color="gray", linestyle="--", linewidth=0.7)
-            ax_bar.set_ylabel("Score / Probability")
-            ax_bar.set_title("Rewards and P(A>B)  |  P(A>B) bar: green=correct, red=wrong", fontsize=8)
-
-            legend_patches = [
-                mpatches.Patch(color="steelblue",      label="r_A"),
-                mpatches.Patch(color="darkorange",     label="r_B"),
-                mpatches.Patch(color="mediumseagreen", label="P(A>B) — correct"),
-                mpatches.Patch(color="firebrick",      label="P(A>B) — wrong"),
-                mpatches.Patch(color="gray",           label="P(A>B) — GT Equal"),
-            ]
-            ax_bar.legend(handles=legend_patches, fontsize=7, loc="upper right")
-
-            # Value labels + GT/Pred text per dimension
-            for bars in [bars_ra, bars_rb, bars_pa]:
-                for bar in bars:
-                    h = bar.get_height()
-                    ax_bar.text(
-                        bar.get_x() + bar.get_width() / 2, h + 0.01,
-                        f"{h:.2f}", ha="center", va="bottom", fontsize=6,
-                    )
-            for i, (pred, gt) in enumerate(zip(pred_label, gt_label)):
-                correct = (pred == gt) if gt != "=" else None
-                color = "darkgreen" if correct else ("firebrick" if correct is False else "gray")
-                ax_bar.text(
-                    x[i], 1.22,
-                    f"GT: {gt}  Pred: {pred}",
-                    ha="center", va="bottom", fontsize=8, fontweight="bold", color=color,
+            # ---- per-axis charts (static, drawn once) ----
+            # One panel per non-Equal axis: r_A vs r_B bars on the score scale;
+            # the pairwise verdict (GT / Pred / P(A>B)) lives in the panel title
+            # so the 0..1 probability never shares a y-axis with raw scores.
+            for j, k in enumerate(shown):
+                axp = axis_axes[j]
+                ra, rb, p = float(r_a_np[k]), float(r_b_np[k]), float(prob_a[k])
+                pred = "A" if p > 0.5 else ("B" if p < 0.5 else "=")
+                gt = "A" if gt_vals[k] == 1.0 else ("B" if gt_vals[k] == 0.0 else "=")
+                ok = pred == gt
+                bars = axp.bar([0, 1], [ra, rb], 0.6,
+                               color=["steelblue", "darkorange"], alpha=0.85)
+                for bar, v in zip(bars, (ra, rb)):
+                    axp.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                             f"{v:.2f}", ha="center", va="bottom", fontsize=7)
+                axp.set_xticks([0, 1])
+                axp.set_xticklabels(["r_A", "r_B"], fontsize=9)
+                axp.set_title(
+                    f"{axis_names[k]}\nGT: {gt}   Pred: {pred}   P(A>B)={p:.2f}",
+                    fontsize=9, fontweight="bold",
+                    color="darkgreen" if ok else "firebrick",
                 )
+            axis_axes[0].set_ylabel("cumulative score", fontsize=8)
 
             # ---- animation ----
             frame_label = ax_tp_a.text(
@@ -179,7 +174,7 @@ def visualize_validation_batch(
 
             anim = FuncAnimation(fig, update, frames=T, interval=1000 // fps, blit=True)
 
-            fname = os.path.join(out_dir, f"step{step:06d}_val{idx:02d}_{session}.mp4")
+            fname = os.path.join(out_dir, f"step{step:06d}_pair{idx:02d}_{session}.mp4")
             anim.save(fname, writer=FFMpegWriter(fps=fps))
             plt.close(fig)
 
@@ -197,6 +192,8 @@ def visualize_top_bottom_trajectories(
     n_uniform: int = 10,
     step: int = 0,
     fps: int = 10,
+    axis_keys: list = None,
+    open_axis: bool = False,
 ):
     """
     For each preference dimension, collect rewards for every individual trajectory
@@ -207,13 +204,25 @@ def visualize_top_bottom_trajectories(
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
     K = len(preference_keys)
+    axis_names = list(axis_keys) if axis_keys is not None else list(preference_keys)
 
-    # Collect (tp_frames, reward_vector) for every individual trajectory
+    # Collect (tp_frames, reward_vector) for every individual trajectory.
+    # Dedupe by episode identity: episodes recur across pairs, and scoring
+    # each occurrence would waste compute and fill rankings with repeats.
     entries = []  # list of {"frames": (T,H,W,3) uint8 numpy, "reward": (K,) float}
+    samples_meta = getattr(dataset, "samples", None)
+    seen_refs = set()
     with torch.no_grad():
         for idx in range(len(dataset)):
             item = dataset[idx]
             for traj_key in ("traj_a", "traj_b"):
+                if samples_meta is not None:
+                    side = traj_key[-1]
+                    ref = traj_identity(samples_meta[idx], side)
+                    if ref is not None:
+                        if ref in seen_refs:
+                            continue
+                        seen_refs.add(ref)
                 tp_frames = item[traj_key]["third_person"]   # (T, 3, H, W) uint8
                 if isinstance(model, FlowRewardModel):
                     obs = {k: v.unsqueeze(0).to(device) for k, v in item[traj_key].items()
@@ -222,8 +231,18 @@ def visualize_top_bottom_trajectories(
                 else:
                     wr_frames = item[traj_key]["wrist"]
                     mask = item[traj_key]["padding_mask"].unsqueeze(0).to(device)
-                    r = model(tp_frames.unsqueeze(0).to(device),
-                              wr_frames.unsqueeze(0).to(device), mask).squeeze(0).cpu().numpy()  # (K,)
+                    if open_axis:
+                        # 1-head language model: score once per axis prompt so the
+                        # rankings are per-axis, not generic-prompt.
+                        r = np.array([
+                            float(model(tp_frames.unsqueeze(0).to(device),
+                                        wr_frames.unsqueeze(0).to(device), mask,
+                                        axis_labels=[ax]).reshape(-1)[0])
+                            for ax in axis_names
+                        ])
+                    else:
+                        r = model(tp_frames.unsqueeze(0).to(device),
+                                  wr_frames.unsqueeze(0).to(device), mask).squeeze(0).cpu().numpy()  # (K,)
                 entries.append({
                     "frames": tp_frames.permute(0, 2, 3, 1).numpy(),  # (T, H, W, 3)
                     "reward": r,
@@ -269,7 +288,7 @@ def visualize_top_bottom_trajectories(
     top_bottom_paths = []
     uniform_paths = []
 
-    for k, key in enumerate(preference_keys):
+    for k, key in enumerate(axis_names):
         sorted_idx = np.argsort(rewards_all[:, k])
         safe_key = key.replace("/", "_").replace(" ", "_")
 
