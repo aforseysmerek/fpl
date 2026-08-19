@@ -314,6 +314,8 @@ def main(args: Args):
     t_copy = 0.0
     total_frames = 0
     episode_metadata = []  # per-episode info
+    staged_files = {}  # source path -> local staged copy (sim episodes files
+                       # are referenced by MANY score JSONs; copy each once)
 
     # Rolling window for per-step wandb logging
     step_window = max(1, args.wandb_step_window)
@@ -326,6 +328,12 @@ def main(args: Args):
             score_data = json.load(f)
 
         source_hdf5_str = score_data["source_hdf5"]
+        # Sim episodes refs: 'path#demo_key' means this score belongs to exactly
+        # ONE demo of a multi-demo file. Real-robot JSONs carry plain paths and
+        # keep their existing behavior (all demos in the file).
+        ref_demo = None
+        if "#" in source_hdf5_str:
+            source_hdf5_str, ref_demo = source_hdf5_str.split("#", 1)
         source_hdf5 = Path(source_hdf5_str)
         # Remap paths written on another machine under a local root, preserving
         # the relative subpath (avoids basename collisions across subdirs).
@@ -348,18 +356,22 @@ def main(args: Args):
         # Capture source file size before copy
         source_size_bytes = source_hdf5.stat().st_size
 
-        # Copy HDF5 to local disk for fast reads
+        # Copy HDF5 to local disk for fast reads (once per unique source file)
         t0 = time.time()
-        local_hdf5 = hdf5_stage / source_hdf5.name
-        shutil.copy2(source_hdf5, local_hdf5)
+        local_hdf5 = staged_files.get(source_hdf5)
+        if local_hdf5 is None:
+            local_hdf5 = hdf5_stage / source_hdf5.name
+            shutil.copy2(source_hdf5, local_hdf5)
+            staged_files[source_hdf5] = local_hdf5
         t_copy_file = time.time() - t0
         t_copy += t_copy_file
 
         try:
             with h5py.File(local_hdf5, "r") as f:
-                demo_keys = sorted(f["data"].keys())
+                demo_keys = [ref_demo] if ref_demo else sorted(f["data"].keys())
         except OSError as e:
             print(f"  [skip] corrupted file {source_hdf5_str}: {e}")
+            staged_files.pop(source_hdf5, None)
             local_hdf5.unlink(missing_ok=True)
             skipped += 1
             continue
@@ -371,16 +383,25 @@ def main(args: Args):
                     demo = f[f"data/{demo_key}"]
                     obs = demo["obs"]
 
-                    if isinstance(demo["actions"], h5py.Dataset):
+                    joint_pos = obs["JOINT_POS"][:]
+                    if isinstance(demo["actions"], h5py.Dataset) and "actions_abs" in demo:
                         actions_vel = demo["actions"][:]
                         actions_abs = demo["actions_abs"][:]
                         gripper_action = actions_abs[:, -1:]
+                    elif isinstance(demo["actions"], h5py.Dataset):
+                        # Sim episodes: stored actions are OSC deltas, but the
+                        # pi05-droid checkpoint speaks joint velocities — derive
+                        # them from JOINT_POS at the dataset fps (rad/s; final
+                        # step repeats position -> zero velocity). No gripper DOF.
+                        actions_vel = (np.diff(joint_pos, axis=0, append=joint_pos[-1:])
+                                       * float(args.fps)).astype(np.float32)
+                        gripper_action = np.zeros((joint_pos.shape[0], 1), dtype=np.float32)
                     else:
                         actions_vel = demo["actions"]["joint_velocity"][:]
                         gripper_action = demo["actions"]["gripper_position"][:]
 
-                    joint_pos = obs["JOINT_POS"][:]
-                    gripper_obs = obs["GRIPPER"][:]
+                    gripper_obs = (obs["GRIPPER"][:] if "GRIPPER" in obs
+                                   else np.zeros((joint_pos.shape[0], 1), dtype=np.float32))
                     agent_view = obs["agent_view"][:]
                     wrist_view = obs["wrist"][:]
                     T = actions_vel.shape[0]
@@ -513,8 +534,10 @@ def main(args: Args):
                 skipped += 1
                 continue
 
-        local_hdf5.unlink(missing_ok=True)
+        # Staged copies are kept for reuse across score JSONs that reference the
+        # same source file (sim episodes layout); everything is removed below.
 
+    shutil.rmtree(hdf5_stage, ignore_errors=True)
     t_total = time.time() - t_total_start
     print(f"\n--- Timing breakdown ---")
     print(f"  Total:        {t_total:.1f}s")
