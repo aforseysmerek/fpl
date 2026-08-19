@@ -37,6 +37,21 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Not upstream openpi: disable orbax's ArrayMetadata bookkeeping (per-host
+    # array_metadatas/* files + finalize-time validation). On SageMaker,
+    # /opt/ml/checkpoints is watched by the S3 sync agent, which races with
+    # these files: they read back empty at finalize and the save dies with
+    # JSONDecodeError. The store is an optional integrity check; checkpoint
+    # save/restore does not depend on it (upstream pi05 checkpoints ship
+    # without these files). Passing array_metadata_store=None is the
+    # documented off-switch; all other ArrayHandler args match the default
+    # registration.
+    ocp.type_handlers.register_type_handler(
+        jax.Array,
+        ocp.type_handlers.ArrayHandler(array_metadata_store=None),
+        override=True,
+    )
+
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
