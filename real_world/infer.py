@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from dataset import load_trajectory, load_trajectories_all_offsets
+from dataset import load_trajectory, load_trajectories_all_offsets, _split_h5_ref
 from model import RewardModel, DiscountedRewardModel
 from flow_model import RewardModel as FlowRewardModel
 from qwen_model import QwenRewardModel
@@ -184,8 +184,9 @@ def compute_quantile_edges(all_scores: dict[str, list[float]]) -> dict[str, list
 def _load_frames(hdf5_path: str, stride: int, seq_len: int, cell_size: int) -> np.ndarray:
     """Return agent_view frames as (T, cell_size, cell_size, 3) uint8."""
     import h5py
-    with h5py.File(hdf5_path, "r") as f:
-        demo_key = next(iter(f["data"].keys()))
+    _path, _key = _split_h5_ref(hdf5_path)
+    with h5py.File(_path, "r") as f:
+        demo_key = _key or next(iter(f["data"].keys()))
         obs = f[f"data/{demo_key}/obs"]
         total = obs["agent_view"].shape[0]
         indices = list(range(0, total, stride))[:seq_len]
@@ -258,14 +259,35 @@ def create_ranking_video(
         writer.write(cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
 
     writer.release()
+    _transcode_h264(out_path)
     return out_path
+
+
+def _transcode_h264(path: str) -> None:
+    """Re-encode a cv2-written (mp4v) video to H.264 in place so browsers and
+    default players can decode it. Keeps the mp4v file if ffmpeg is missing."""
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None:
+        return
+    tmp = path + ".h264.mp4"
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", path,
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", tmp],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        os.replace(tmp, path)
+    elif os.path.exists(tmp):
+        os.remove(tmp)
 
 
 def render_trajectory_video(hdf5_path: str, out_path: str, stride: int, seq_len: int, img_size: int) -> None:
     """Write agent_view + wrist frames side-by-side as an mp4."""
     import h5py
-    with h5py.File(hdf5_path, "r") as f:
-        demo_key = next(iter(f["data"].keys()))
+    _path, _key = _split_h5_ref(hdf5_path)
+    with h5py.File(_path, "r") as f:
+        demo_key = _key or next(iter(f["data"].keys()))
         obs = f[f"data/{demo_key}/obs"]
         total = obs["agent_view"].shape[0]
         indices = list(range(0, total, stride))[:seq_len]
@@ -282,6 +304,7 @@ def render_trajectory_video(hdf5_path: str, out_path: str, stride: int, seq_len:
     for frame in frames:
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     writer.release()
+    _transcode_h264(out_path)
 
 
 def visualize_distributions(
@@ -729,6 +752,7 @@ def create_overall_ranking_video(
             writer.write(cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
 
         writer.release()
+        _transcode_h264(out_path)
         print(f"Overall ranking video saved → {out_path}")
         out_paths.append(out_path)
 
@@ -839,7 +863,10 @@ def print_stats(all_scores: dict[str, list[float]], quantile_edges: dict[str, li
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", required=True, help="Path to .pt checkpoint")
-    parser.add_argument("--preferences_dir", type=str, default="preferences")
+    parser.add_argument("--preferences_dir", type=str, default=None,
+                        help="Comma-separated preference-pair root dirs to scan. Omit to score "
+                             "only --episodes (previously defaulted to './preferences', which "
+                             "crashed episodes-only runs when the dir was absent).")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (flow model sampling + video sampling)")
     # These are read from the checkpoint by default; override if needed
@@ -859,6 +886,12 @@ def main():
                         help="Number of trajectories to show in the ranking grid video")
     parser.add_argument("--ranking_cell_size", type=int, default=96,
                         help="Pixel size of each cell in the ranking grid")
+    parser.add_argument("--episodes", action="append", default=None,
+                        help="episodes.hdf5 whose EVERY data/demo_* is scored as an "
+                             "individual trajectory (repeatable; sim on-the-fly flow)")
+    parser.add_argument("--reward_axes", type=str, default=None,
+                        help="comma-separated oracle axes; prompt phrases derived via "
+                             "AXIS_PROMPT (alternative to --task, for sim tasks)")
     parser.add_argument("--task", type=str, default=None,
                         help="If set, override the task stored in the checkpoint and run "
                              "inference using this task's preference axes instead.")
@@ -868,7 +901,7 @@ def main():
                              "rewards (stride× more forward passes; denser plot points).")
     args = parser.parse_args()
 
-    args.preferences_dir = [d.strip() for d in args.preferences_dir.split(",")]
+    args.preferences_dir = [d.strip() for d in (args.preferences_dir or "").split(",") if d.strip()]
 
     torch.manual_seed(args.seed)
 
@@ -899,7 +932,19 @@ def main():
         task = args.task
     else:
         task = saved_task
-    args.preference_keys = [k.lower() for k in TASKS[task]]
+    if args.reward_axes:
+        # Sim episodes flow: derive prompt phrases the same way the trainer
+        # does (AXIS_PROMPT), so they match what the checkpoint trained with.
+        import sys
+        _rm_dir = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "diffusion_policy", "reward_model"))
+        if _rm_dir not in sys.path:
+            sys.path.insert(0, _rm_dir)
+        from preferences import AXIS_PROMPT
+        args.preference_keys = [AXIS_PROMPT.get(a.strip(), a.strip()).lower()
+                                for a in args.reward_axes.split(",") if a.strip()]
+    else:
+        args.preference_keys = [k.lower() for k in TASKS[task]]
 
     model_type = saved_args.get("model", "transformer")
     if model_type == "flow":
@@ -980,6 +1025,16 @@ def main():
         and os.path.isfile(os.path.join(root, f))
     )
 
+    # Sim episodes files: score EVERY demo as its own trajectory via
+    # 'path#demo_key' refs (same convention as the trainer's pair building;
+    # all loaders resolve them through _split_h5_ref).
+    if args.episodes:
+        for ep in args.episodes:
+            ep_abs = os.path.abspath(ep)
+            with h5py.File(ep_abs, "r") as f:
+                _keys = sorted(f["data"].keys(), key=lambda s: int(s.split("_")[1]))
+            standalone_hdf5.extend(f"{ep_abs}#{k}" for k in _keys)
+
     # Pass 1: score all trajectories, collect raw scores
     all_scores = defaultdict(list)
     results = []       # [(pref_dir, hdf5_a, raw_a, hdf5_b, raw_b)]
@@ -1030,8 +1085,9 @@ def main():
     # Score standalone HDF5 files
     for hdf5_path in standalone_hdf5:
         try:
-            with h5py.File(hdf5_path, "r") as f:
-                demo_key = next(iter(f["data"].keys()))
+            _p, _k = _split_h5_ref(hdf5_path)
+            with h5py.File(_p, "r") as f:
+                demo_key = _k or next(iter(f["data"].keys()))
                 _ = f[f"data/{demo_key}/obs/agent_view"].shape
                 _ = f[f"data/{demo_key}/obs/JOINT_POS"].shape
         except (OSError, KeyError, StopIteration):
@@ -1046,7 +1102,7 @@ def main():
         per_frame_by_path[hdf5_path] = pf
         for k, v in raw.items():
             all_scores[k].append(v)
-        name = os.path.splitext(os.path.basename(hdf5_path))[0]
+        name = os.path.basename(hdf5_path).replace(".hdf5#", "_").replace(".hdf5", "")
         s_str = ", ".join(f"{k}: {v:.3f}" for k, v in raw.items())
         print(f"[{name}]  {s_str}")
 
@@ -1165,7 +1221,7 @@ def main():
         os.makedirs(solo_dir, exist_ok=True)
         for i, (hdf5_path, raw) in enumerate(solo_results):
             out = _make_score_dict(raw, hdf5_path)
-            name = os.path.splitext(os.path.basename(hdf5_path))[0]
+            name = os.path.basename(hdf5_path).replace(".hdf5#", "_").replace(".hdf5", "")
             out_path = os.path.join(solo_dir, f"{prefix}_score_{name}.json")
             with open(out_path, "w") as f:
                 json.dump(out, f, indent=2)
