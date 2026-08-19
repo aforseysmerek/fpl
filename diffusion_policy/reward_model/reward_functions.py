@@ -456,18 +456,140 @@ def peg_reward_raw(obs, actions=None, reward_series=None):
 # whether obs comes straight from state_lowdim or is reconstructed from the
 # per-key split, since the split preserves column order.)
 # ----------------------------------------------------------------------------
-def circularity(obs, actions=None, reward_series=None):
-    """Total turning (radians) of the eef xy path — high for circular scrubbing,
-    low for straight wipes. Mirrors scripts/wipe_trace.circularity_metric."""
-    if obs is None or len(obs) < 2:
+# --- circle-detection gates for _circle_fraction ---------------------------
+# Radius band matches generation (wipe_trace CIRC_RADIUS_RANGE = 3-5 cm loops)
+# with margin; the upper gate also rejects straight-ish segments, which fit
+# circles of huge radius. RMS gate: points must lie on the fitted circle to
+# within this fraction of its radius (rejects zigzags / scribbles of the right
+# amplitude but wrong shape).
+CIRC_SMOOTH_WINDOW = 15   # moving-average steps (~0.75 s at 20 Hz): kills mm tracking jitter, keeps 3 cm loops
+CIRC_MIN_STEP = 1e-3      # m, drop sub-mm displacements before measuring heading
+CIRC_R_MIN = 0.02         # m, smallest valid scrub-circle radius
+CIRC_R_MAX = 0.07         # m, largest valid scrub-circle radius
+CIRC_RMS_FRAC = 0.20      # fit RMS residual must be < this fraction of the fitted radius
+CIRC_ROUNDNESS_MIN = 0.55  # minor/major harmonic amplitude ratio: 1 = perfect circle, ~0 = line oscillation
+# Gate calibration (shared_data_wipe, old-knob labels): genuine steady scrub
+# loops fit at rms/r 0.02-0.15 and roundness 0.6-0.95; the approach-phase loop
+# and straight/wandering paths land at roundness 0.14-0.5 and/or rms/r > 0.2.
+
+
+def _fit_drifting_circle(seg):
+    """Fit one closed scrub loop as a circle whose center drifts linearly along
+    the sweep: regress each coordinate on [1, t, cos th, sin th] with th one
+    full turn over the segment (linear least squares — no detrending pass,
+    the drift is part of the model). Returns (radius, roundness, rms):
+    the 2x2 harmonic amplitude matrix's singular values are the trace
+    ellipse's semi-axes, so radius = their geometric mean and roundness =
+    minor/major (a circle has equal x/y amplitudes in quadrature; any
+    line-ish oscillation collapses one axis)."""
+    n = len(seg)
+    tt = np.arange(n)
+    th = 2 * np.pi * tt / (n - 1)
+    X = np.column_stack([np.ones(n), tt / n, np.cos(th), np.sin(th)])
+    coef, *_ = np.linalg.lstsq(X, seg, rcond=None)
+    resid = seg - X @ coef
+    rms = float(np.sqrt(np.mean(np.sum(resid ** 2, axis=1) / 2)))
+    sv = np.linalg.svd(coef[2:4].T, compute_uv=False)
+    r = float(np.sqrt(max(sv[0] * sv[1], 0.0)))
+    return r, float(sv[1] / max(sv[0], 1e-12)), rms
+
+
+def _circle_fraction(path2d, window=CIRC_SMOOTH_WINDOW, min_step=CIRC_MIN_STEP,
+                     r_min=CIRC_R_MIN, r_max=CIRC_R_MAX, rms_frac=CIRC_RMS_FRAC,
+                     roundness_min=CIRC_ROUNDNESS_MIN):
+    """Fraction of the trajectory spent drawing valid scrub circles (0..1).
+
+    Segments the in-plane eef path into closed loops by CUMULATIVE SIGNED
+    TURNING (every +-2pi closes one candidate loop — jitter and zigzags have
+    symmetric turning that cancels, so only sustained same-handed rotation
+    produces candidates). Each candidate gets a drifting-circle fit
+    (_fit_drifting_circle) and counts only if it passes ALL gates: the fit is
+    tight (rms < rms_frac * r), the loop is round (roundness >= roundness_min,
+    rejecting line-ish oscillation), AND the radius is in [r_min, r_max]
+    (too-small scrubbing fails low; straight-ish arcs fit huge radii and fail
+    high). Score = timesteps inside passing loops / total timesteps: bounded,
+    count-invariant, and one lone circle in a long wipe scores low.
+
+    Replaces the retired _total_turning oracle (turning counts loops but is
+    radius-blind — see _total_turning docstring). NOTE: pairs/labels generated
+    with the old oracle are not comparable with this one.
+    """
+    raw = np.asarray(path2d, dtype=float)
+    T = len(raw)
+    if T < 3:
         return 0.0
-    eef_xy = np.asarray(obs)[:, 0:2]
-    d = np.diff(eef_xy, axis=0)
-    d = d[np.linalg.norm(d, axis=1) > 1e-5]
+    p = raw
+    if window > 1 and T > window:
+        k = np.ones(window) / window
+        p = np.stack([np.convolve(raw[:, i], k, mode='valid') for i in range(2)], 1)
+    d = np.diff(p, axis=0)
+    keep = np.linalg.norm(d, axis=1) > min_step
+    if keep.sum() < 3:
+        return 0.0
+    kidx = np.nonzero(keep)[0]          # kept displacement k starts at point kidx[k]
+    dk = d[keep]
+    ang = np.arctan2(dk[:, 1], dk[:, 0])
+    turn = (np.diff(ang) + np.pi) % (2 * np.pi) - np.pi
+    covered = 0
+    cum, start = 0.0, 0                 # start: index into kidx of current candidate
+    for j, t in enumerate(turn):
+        cum += t
+        if abs(cum) < 2 * np.pi:
+            continue
+        s, e = kidx[start], kidx[j + 1] + 1   # point-index span of the closed loop
+        seg = p[s:e + 1]
+        if len(seg) >= 8:
+            r, roundness, rms = _fit_drifting_circle(seg)
+            if r_min <= r <= r_max and roundness >= roundness_min and rms <= rms_frac * r:
+                covered += e - s + 1
+        cum, start = 0.0, j + 1
+    return covered / T
+
+
+def _total_turning(path2d, window=31, min_step=1e-3):
+    """RETIRED oracle (kept for reference / reproducing old labels; nothing
+    imports it anymore). Total turning (radians) of a 2D path — high for
+    circular scrubbing, low for straight wipes. Retired because turning is
+    RADIUS-BLIND (any closed loop is 2pi regardless of size): its knob
+    correlation came from the smoothing window erasing small loops, i.e. a
+    filtering artifact, not a measurement. Superseded by _circle_fraction.
+
+    The path is smoothed (moving average, ~1.5 s at 20 Hz) and sub-@min_step
+    displacements are dropped before measuring turning: raw per-step turning
+    is dominated by mm-scale tracking jitter, which buried the scrub-circle
+    signal in a large noisy baseline. Calibrated on the 200-episode
+    shared_data_wipe set: knob<->score Spearman 0.68 -> 0.91, flipped
+    preference labels on knob-separated pairs 16.3% -> 2.7% (vertical wipe:
+    0.70 -> 0.93, clean low/high separation). NOTE: pairs.npz generated
+    before this change used the noisier raw-turning labels.
+    """
+    p = np.asarray(path2d, dtype=float)
+    if window > 1 and len(p) > window:
+        k = np.ones(window) / window
+        p = np.stack([np.convolve(p[:, i], k, mode='valid') for i in range(2)], 1)
+    d = np.diff(p, axis=0)
+    d = d[np.linalg.norm(d, axis=1) > min_step]
     if len(d) < 2:
         return 0.0
     ang = np.arctan2(d[:, 1], d[:, 0])
     return float(np.sum(np.abs((np.diff(ang) + np.pi) % (2 * np.pi) - np.pi)))
+
+
+def circularity(obs, actions=None, reward_series=None):
+    """Fraction of the eef xy path spent in valid scrub circles — the table
+    (horizontal) wiping plane. See _circle_fraction for the gates."""
+    if obs is None or len(obs) < 2:
+        return 0.0
+    return _circle_fraction(np.asarray(obs)[:, 0:2])
+
+
+def circularity_vertical(obs, actions=None, reward_series=None):
+    """Fraction of the eef (y, z) path spent in valid scrub circles —
+    VerticalWipe's wall plane (normal is world x). Same state_lowdim layout;
+    only the projection plane differs."""
+    if obs is None or len(obs) < 2:
+        return 0.0
+    return _circle_fraction(np.asarray(obs)[:, 1:3])
 
 
 def wiped_frac(obs, actions=None, reward_series=None):
@@ -479,6 +601,65 @@ def wiped_frac(obs, actions=None, reward_series=None):
     return float(np.asarray(obs)[-1, -1])
 
 
+# ---- TwoArmLift pot-carry axes (state_lowdim = [eef0 pose7, eef1 pose7,
+# pot pose7]; pot xy = cols 14:16, pot z = col 16). Carry window = frames where
+# the pot is lifted >2cm above its resting z AND moving laterally — mirrors the
+# collector's scripted carry phase (pair-label parity vs stored per-episode
+# attrs: 96-99.7%; build_pairs prefers the stored attrs when present, these
+# fns cover attr-less data such as policy rollouts). CTRL_DT = 1/20 (20 Hz).
+_POT_CTRL_DT = 1.0 / 20.0
+
+def _pot_carry_window(obs, lift_thresh=0.02, lat_eps=5e-4):
+    st = np.asarray(obs)
+    if st is None or len(st) < 2 or st.shape[1] < 17:
+        return None
+    lift = st[:, 16] - st[0, 16]
+    step = np.zeros(len(st))
+    step[1:] = np.linalg.norm(np.diff(st[:, 14:16], axis=0), axis=1)
+    idx = np.nonzero((lift > lift_thresh) & (step > lat_eps))[0]
+    return (int(idx[0]), int(idx[-1]) + 1) if len(idx) else None
+
+
+def _pot_speed_ms(obs):
+    """Mean lateral pot speed (m/s) over the carry window (physical value)."""
+    w = _pot_carry_window(obs)
+    if w is None:
+        return 0.0
+    t0, t1 = w
+    seg = np.asarray(obs)[t0:t1, 14:16]
+    if len(seg) < 2:
+        return 0.0
+    dist = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1)))
+    return dist / (max(len(seg) - 1, 1) * _POT_CTRL_DT)
+
+
+def _pot_lift_m(obs):
+    """Mean pot lift above its resting z over the carry window (physical value;
+    == pot-bottom height above the table up to a per-episode-constant offset)."""
+    w = _pot_carry_window(obs)
+    if w is None:
+        return 0.0
+    t0, t1 = w
+    st = np.asarray(obs)
+    return float((st[t0:t1, 16] - st[0, 16]).mean())
+
+
+def slow_carry(obs, actions=None, reward_series=None):
+    """Rewarded direction: SLOW carrying wins -> negated lateral speed."""
+    return -_pot_speed_ms(obs)
+
+
+def low_carry(obs, actions=None, reward_series=None):
+    """Rewarded direction: LOW carrying wins -> negated lift height."""
+    return -_pot_lift_m(obs)
+
+
+# Axes whose value genuinely depends on `actions`. Callers that cannot supply
+# actions must refuse to compute these (raise) rather than let the function
+# fall through to its actions-None default — that default is a silently wrong
+# ground-truth value, which is worse than a crash.
+ACTION_DEPENDENT_AXES = {'smoothness'}
+
 # ----------------------------------------------------------------------------
 # Registry: axis name -> function. Add new axes by adding a function and an
 # entry here.
@@ -488,7 +669,10 @@ AXIS_FUNCTIONS = {
     'speed_reward':   speed_reward,
     'smoothness':     smoothness,
     'circularity':    circularity,
+    'circularity_vertical': circularity_vertical,
     'wiped_frac':     wiped_frac,
+    'slow_carry':     slow_carry,
+    'low_carry':      low_carry,
     'order_reward':   order_reward,
     'order_reward_raw': order_reward_raw,
     'milk_placed':    milk_placed,

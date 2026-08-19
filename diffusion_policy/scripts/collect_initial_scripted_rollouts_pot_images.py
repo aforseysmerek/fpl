@@ -32,6 +32,7 @@ import robosuite
 # (mirrors how the wipe collector imports WipeTracePolicy).
 from scripts.pot_trace import (
     PotTracePolicy, speed_metric, height_metric, pot_bottom_above_table, OSC_POSE_ABS, GOAL_XY,
+    set_spawn_back, set_agentview_camera, GOAL_TOL, AIRBORNE_H,
 )
 
 CAMERAS = ["agentview", "robot0_eye_in_hand"]   # third-person + wrist (Qwen needs both)
@@ -77,15 +78,36 @@ def low_dim_state(env, obs):
 @click.option('--grasp_offset', type=float, default=0.0, help='grip_site height above the bar (~fingertip gap; use pot_probe value)')
 @click.option('--goal_x', type=float, default=GOAL_XY[0], help='world x the pot is carried to')
 @click.option('--goal_y', type=float, default=GOAL_XY[1], help='world y the pot is carried to')
-def main(output_dir, num_episodes, seed, grasp_offset, goal_x, goal_y):
+@click.option('--bimodal', is_flag=True,
+              help='Sample each knob from only the LOW or HIGH extreme band (no middle values), '
+                   'so trajectories differ. Appends "_bimodal" to the output dir name.')
+@click.option('--bimodal_band', type=float, default=0.2,
+              help='Band width: LOW=[0, band], HIGH=[1-band, 1] (bimodal); '
+                   'the complement [band, 1-band] is the MIDDLE region (--middle).')
+@click.option('--middle', is_flag=True,
+              help='EVAL set for a bimodal-trained model: sample both knobs from the MIDDLE region '
+                   '[band, 1-band] — the gap the bimodal set never covers ("unseen" range). '
+                   'Appends "_middle" to the output dir name.')
+def main(output_dir, num_episodes, seed, grasp_offset, goal_x, goal_y, bimodal, bimodal_band, middle):
+    if bimodal and middle:
+        raise click.UsageError("--bimodal and --middle are mutually exclusive (extremes vs. the gap).")
     rng = np.random.default_rng(seed)
     goal_xy = (goal_x, goal_y)
+    # Tag the dir so different sampling regimes are never confused.
+    tag = "bimodal" if bimodal else ("middle" if middle else "")
+    if tag and tag not in os.path.basename(output_dir):
+        output_dir = f"{output_dir}_{tag}"
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+    mode = "BIMODAL" if bimodal else ("MIDDLE" if middle else "uniform")
+    print(f"Sampling: {mode}{(' band=%.2f' % bimodal_band) if (bimodal or middle) else ''}  ->  {output_dir}",
+          flush=True)
 
     env = create_pot_env()
     adim = env.action_dim
     j0 = env.robots[0]._ref_joint_pos_indexes
     j1 = env.robots[1]._ref_joint_pos_indexes
+    set_spawn_back(env)   # longer A->B carry, same as the pot_trace sweeps (applies on reset)
+    handle_geoms = [env.pot.handle0_geoms, env.pot.handle1_geoms]   # indexed by arm{0,1}_hidx
 
     out = h5py.File(pathlib.Path(output_dir) / "episodes.hdf5", "w")
     data_grp = out.create_group("data")
@@ -96,18 +118,34 @@ def main(output_dir, num_episodes, seed, grasp_offset, goal_x, goal_y):
     kept = 0
     attempt = 0
     max_attempts = num_episodes * 4
+    # Bimodal: each knob drawn from LOW=[0, band] or HIGH=[1-band, 1], with the 4
+    # (speed, height) quadrants cycled round-robin over KEPT episodes — not attempts,
+    # so retried grasp failures don't unbalance the quadrants (50 each at n=200).
+    def _band(is_high):
+        return float(rng.uniform(1.0 - bimodal_band, 1.0) if is_high else rng.uniform(0.0, bimodal_band))
+    quadrants = [(False, False), (False, True), (True, False), (True, True)]  # (speed_high, height_high)
+
     while kept < num_episodes and attempt < max_attempts:
         attempt += 1
-        speed_amount = float(rng.uniform(0.0, 1.0))
-        height_amount = float(rng.uniform(0.0, 1.0))
+        if bimodal:
+            speed_high, height_high = quadrants[kept % 4]
+            speed_amount = _band(speed_high)
+            height_amount = _band(height_high)
+        elif middle:
+            speed_amount = float(rng.uniform(bimodal_band, 1.0 - bimodal_band))
+            height_amount = float(rng.uniform(bimodal_band, 1.0 - bimodal_band))
+        else:
+            speed_amount = float(rng.uniform(0.0, 1.0))
+            height_amount = float(rng.uniform(0.0, 1.0))
         obs = env.reset()
+        set_agentview_camera(env)   # zoom out (idempotent; before any render)
         policy = PotTracePolicy(env, obs["robot0_eef_pos"], obs["robot1_eef_pos"],
-                                obs["robot0_eef_quat"], obs["robot1_eef_quat"],
                                 speed_amount=speed_amount, height_amount=height_amount,
                                 grasp_offset=grasp_offset, goal_xy=goal_xy)
 
         tp_l, wr_l, jp_l, low_l, pot_xy, heights, act_l = [], [], [], [], [], [], []
-        for _ in range(policy.max_t):
+        grasped = (False, False)
+        for i in range(policy.max_t):
             tp_l.append(to_uint8_hwc(obs["agentview_image"]))          # pre-action state
             wr_l.append(to_uint8_hwc(obs["robot0_eye_in_hand_image"]))
             jp = np.concatenate([env.sim.data.qpos[j0], env.sim.data.qpos[j1]]).astype(np.float32)
@@ -121,13 +159,23 @@ def main(output_dir, num_episodes, seed, grasp_offset, goal_x, goal_y):
             act_l.append(action.copy())
             obs, *_ = env.step(action)
             heights.append(pot_bottom_above_table(env))
+            # gate the lift just before it begins: if either handle isn't held,
+            # this attempt is doomed -> abort now (it would be discarded anyway)
+            if i == policy.grasp_check_t:
+                grasped = (bool(env._check_grasp(env.robots[0].gripper, handle_geoms[policy.arm0_hidx])),
+                           bool(env._check_grasp(env.robots[1].gripper, handle_geoms[policy.arm1_hidx])))
+                if not all(grasped):
+                    break
 
         spd = speed_metric(pot_xy, policy.carry_t0, policy.carry_t1)
         hgt = height_metric(heights, policy.carry_t0, policy.carry_t1)
         goal_dist = float(np.linalg.norm(pot_xy[-1] - policy.goal_xy))
-        success = bool(env._check_success())
+        # our carry gate (NOT env._check_success(): that needs pot > table+0.10,
+        # which the low-carry end deliberately undershoots)
+        success = bool(all(grasped) and goal_dist < GOAL_TOL and hgt > AIRBORNE_H)
         if not success:
-            print(f"  attempt {attempt:3d}: NOT lifted (speed_knob={speed_amount:.2f} "
+            print(f"  attempt {attempt:3d}: FAILED carry gate (grasped={all(grasped)} "
+                  f"goal_dist={goal_dist:5.3f} carry_height={hgt:5.3f} | speed_knob={speed_amount:.2f} "
                   f"height_knob={height_amount:.2f}) — skipped", flush=True)
             continue
 
@@ -149,6 +197,9 @@ def main(output_dir, num_episodes, seed, grasp_offset, goal_x, goal_y):
     data_grp.attrs["n_attempts"] = attempt
     data_grp.attrs["cameras"] = json.dumps(CAMERAS)
     data_grp.attrs["axes"] = json.dumps(["speed", "carry_height"])
+    data_grp.attrs["sampling"] = "bimodal" if bimodal else ("middle" if middle else "uniform")
+    if bimodal or middle:
+        data_grp.attrs["bimodal_band"] = float(bimodal_band)
     out.close()
     print(f"\nWrote {kept} successful demos ({attempt} attempts, "
           f"{kept/max(attempt,1)*100:.0f}% success) to {output_dir}/episodes.hdf5")
